@@ -305,7 +305,13 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    total = data["order_total"]
+    total = data.get("order_total")
+    if total is None:
+        # FSM state was lost (e.g. stale/duplicate bot instance, or the
+        # session expired) — recover gracefully instead of crashing.
+        await callback.answer(t(lang, "payment_error"), show_alert=True)
+        await show_cart(callback.from_user.id, callback.message.answer, offer_payment=True, state=state)
+        return
     order_id = f"order_{callback.from_user.id}_{int(time.time())}"
     db.create_order(order_id, callback.from_user.id, total, method)
     await state.clear()
@@ -315,15 +321,25 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     # this wrong would charge customers 100x too little or too much.
     amount_tiyin = total * 100
 
-    await callback.bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=t(lang, "invoice_title"),
-        description=t(lang, "invoice_description"),
-        payload=order_id,
-        provider_token=provider_token,
-        currency="UZS",
-        prices=[LabeledPrice(label=t(lang, "total"), amount=amount_tiyin)],
-    )
+    try:
+        await callback.bot.send_invoice(
+            chat_id=callback.from_user.id,
+            title=t(lang, "invoice_title"),
+            description=t(lang, "invoice_description"),
+            payload=order_id,
+            provider_token=provider_token,
+            currency="UZS",
+            prices=[LabeledPrice(label=t(lang, "total"), amount=amount_tiyin)],
+        )
+    except Exception as e:
+        # Without this, a bad/misconfigured provider token throws here and the
+        # callback never gets answered — the button just spins forever on the
+        # customer's screen with no error shown. Log the real reason so it's
+        # visible in `get-logs` instead of silently failing.
+        print(f"[payment] send_invoice failed for method={method} order={order_id}: {e}")
+        await callback.answer(t(lang, "payment_error"), show_alert=True)
+        return
+
     await callback.answer()
 
 
