@@ -169,8 +169,10 @@ def get_order(order_id: str) -> dict | None:
     return {
         "order_id": row[0], "user_id": row[1], "total": row[2],
         "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
-
-        
-
-
     }
+
+
+def delete_pending_order(order_id: str):
+    """Permanently removes an unpaid order from the database."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM orders WHERE order_id = ? AND status = 'pending'", (order_id,))
