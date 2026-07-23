@@ -171,12 +171,6 @@ def get_order(order_id: str) -> dict | None:
         "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
 
         
-def remove_item_from_cart(user_id: int):
-    """Deletes the latest item or clears the cart for this user."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+
 
     }
