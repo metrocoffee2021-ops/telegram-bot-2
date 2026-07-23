@@ -1,0 +1,13 @@
+# .env
+# Your bot's private settings.
+# NEVER share this file or paste its contents in chat/screenshots.
+
+BOT_TOKEN=8440342960:AAEAxzvsQ_QikwOsdO3gUuOsSiHIXCJXUB4
+
+# Your own Telegram numeric ID — only this account can send /broadcast and /admin.
+# Get it by messaging @userinfobot on Telegram.
+OWNER_TELEGRAM_ID=254992659
+
+# Payment provider tokens from @BotFather -> /mybots -> Metropia_bot -> Payments.
+CLICK_PROVIDER_TOKEN=333605228:LIVE:15583_14FCE6541E039D29AA11E145D2C0038AE9E87BEC
+PAYME_PROVIDER_TOKEN=
