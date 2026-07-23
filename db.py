@@ -96,7 +96,6 @@ def add_stamp(user_id: int) -> dict:
         else:
             stamps, first_stamp_at, pending = row
             if pending:
-                # staff already handed over a free coffee at this visit — start fresh
                 stamps = 1
                 conn.execute(
                     "UPDATE loyalty SET stamps = 1, first_stamp_at = ?, free_coffee_pending = 0 WHERE user_id = ?",
@@ -138,7 +137,7 @@ def get_loyalty_status(user_id: int) -> dict | None:
     return {"stamps": stamps, "first_stamp_at": first_stamp_at, "free_coffee_pending": bool(pending)}
 
 
-# ---- orders (used to match a payment confirmation back to the right order) ----
+# ---- orders ----
 
 def create_order(order_id: str, user_id: int, total: int, payment_method: str):
     with get_db() as conn:
@@ -167,8 +166,12 @@ def get_order(order_id: str) -> dict | None:
     if not row:
         return None
     return {
-        "order_id": row[0], "user_id": row[1], "total": row[2],
-        "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
+        "order_id": row[0],
+        "user_id": row[1],
+        "total": row[2],
+        "status": row[3],
+        "payment_method": row[4],
+        "gateway_ref": row[5],
     }
 
 
