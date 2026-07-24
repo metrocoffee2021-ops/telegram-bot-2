@@ -1,228 +1,253 @@
-# handlers.py
-import os
-import time
-import math
+# db.py
+# All the bot's saved data (which language each customer picked, and their
+# loyalty stamps) lives in one file: metropia.db — created automatically the
+# first time the bot runs. Back this file up along with the rest of the bot.
 
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.filters import CommandStart, Command
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 
-from texts import t
-from menu_data import EXTRA_TOPPING_PRICE
-import menu_store
-import db
+DB_PATH = "metropia.db"
 
-router = Router()
-OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
-BARISTA_GROUP_ID = int(os.environ.get("BARISTA_GROUP_ID", "0"))
-
-PROVIDER_TOKENS = {
-    "click": os.environ.get("CLICK_PROVIDER_TOKEN", ""),
-    "payme": os.environ.get("PAYME_PROVIDER_TOKEN", ""),
-}
+STAMPS_FOR_FREE_ITEM = 10   # buy 9, the 10th is free
+CARD_VALID_DAYS = 30        # matches the offline card: valid one month after the first stamp
 
 
-class OrderFlow(StatesGroup):
-    choosing_payment_method = State()
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def fmt_price(amount: int) -> str: return f"{amount:_}".replace("_", " ")
-def temps_for(item: dict) -> list[str]: return list(set(v["temp"] for v in item["variants"]))
-def sizes_for(item: dict, temp: str) -> list[str | None]: return [v["size"] for v in item["variants"] if v["temp"] == temp]
-def price_for(item: dict, temp: str, size: str | None) -> int:
-    return next((v["price"] for v in item["variants"] if v["temp"] == temp and v["size"] == size), 0)
-def price_range_text(item: dict) -> str:
-    prices = [v["price"] for v in item["variants"]]
-    if not prices: return "—"
-    lo, hi = min(prices), max(prices)
-    return f"{fmt_price(lo)} so'm" if lo == hi else f"{fmt_price(lo)}-{fmt_price(hi)} so'm"
-def lang_of(user_id: int) -> str: return db.get_user_language(user_id)
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def main_menu_keyboard(lang: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text=t(lang, "menu_button"), callback_data="menu")
-    kb.button(text="🛒 Savatcha / View Cart", callback_data="cart:view")
-    kb.button(text="🎁 Stamp Card", callback_data="loyalty:view")
-    kb.adjust(2)
-    return kb.as_markup()
+def _add_column_if_missing(conn, table: str, column: str, coltype: str):
+    """Safely add a column to an existing table — needed because CREATE TABLE
+    IF NOT EXISTS does nothing to a table that already exists (e.g. on a
+    database that's already live on Railway from before this update)."""
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
-# ---------- language and onboarding ----------
-
-@router.message(CommandStart())
-async def start(message: Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="O'zbek", callback_data="lang:uz")
-    kb.button(text="Русский", callback_data="lang:ru")
-    kb.button(text="English", callback_data="lang:en")
-    kb.adjust(3)
-    await message.answer(t("en", "choose_language"), reply_markup=kb.as_markup())
-
-
-@router.callback_query(F.data.startswith("lang:"))
-async def set_language(callback: CallbackQuery):
-    lang = callback.data.split(":")[1]  # CORRECTED INDEX
-    db.save_user_language(callback.from_user.id, lang)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish / Send Phone Number", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
-    await callback.message.answer("Tasdiqlash uchun telefon raqamingizni yuboring:\nPlease share your phone number to verify registration:", reply_markup=kb)
-    await callback.answer()
-
-
-@router.message(F.contact)
-async def handle_contact(message: Message):
-    user_id = message.from_user.id
-    with db.get_db() as conn:
-        conn.execute("UPDATE users SET phone = ? WHERE user_id = ?", (message.contact.phone_number, user_id))
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Joylashuvni yuborish / Send Location", request_location=True)]], resize_keyboard=True, one_time_keyboard=True)
-    await message.answer("Sizga eng yaqin qahvaxonamizni ko'rsatish uchun joylashuvingizni ulashing:\nPlease send your location to find the closest coffee shop:", reply_markup=kb)
-
-
-@router.message(F.location)
-async def handle_location(message: Message):
-    user_id = message.from_user.id
-    lang = lang_of(user_id)
-    lat, lon = message.location.latitude, message.location.longitude
-    db.save_user_location(user_id, lat, lon)
-    
-    luxor_dist = math.sqrt((lat - 41.2721)**2 + (lon - 69.2553)**2)
-    sayram_dist = math.sqrt((lat - 41.3283)**2 + (lon - 69.3248)**2)
-    closest_branch = "☕ METROPIA LUXOR (Abdulla Qaxxor 150A)" if luxor_dist < sayram_dist else "☕ METROPIA SAYRAM (Sayram street 4A)"
-    
-    confirm_text = {"uz": f"Rahmat! Eng yaqin filial: {closest_branch}", "ru": f"Спасибо! Ближайший филиал: {closest_branch}", "en": f"Thank you! Closest branch: {closest_branch}"}.get(lang, closest_branch)
-    await message.answer(confirm_text, reply_markup=ReplyKeyboardRemove())
-    await message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
+def init_db():
+    with get_db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            lang TEXT DEFAULT 'en',
+            phone TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS loyalty (
+            user_id INTEGER PRIMARY KEY,
+            stamps INTEGER DEFAULT 0,
+            first_stamp_at TEXT,
+            free_coffee_pending INTEGER DEFAULT 0
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            total INTEGER,
+            status TEXT DEFAULT 'pending',
+            payment_method TEXT,
+            gateway_ref TEXT,
+            phone TEXT,
+            branch_name TEXT,
+            items_summary TEXT,
+            created_at TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+        # Columns added after the first release — safe to run every startup.
+        _add_column_if_missing(conn, "orders", "notes", "TEXT")
+        _add_column_if_missing(conn, "orders", "items_json", "TEXT")
+        _add_column_if_missing(conn, "orders", "status_notified_ready", "INTEGER DEFAULT 0")
 
 
-# ---------- menu browsing ----------
+# ---- language ----
 
-@router.message(Command("menu"))
-async def menu_command(message: Message): await show_categories(message.from_user.id, message.answer)
-@router.callback_query(F.data == "menu")
-async def menu_callback(callback: CallbackQuery): await show_categories(callback.from_user.id, callback.message.answer); await callback.answer()
-
-
-async def show_categories(user_id: int, send):
-    lang = lang_of(user_id)
-    categories = menu_store.list_categories()
-    if not categories: await send(t(lang, "menu_currently_empty")); return
-    kb = InlineKeyboardBuilder()
-    for cat in categories: kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
-    kb.button(text="🛒 View Cart", callback_data="cart:view")
-    kb.adjust(2)
-    await send(t(lang, "choose_category"), reply_markup=kb.as_markup())
+def save_user_language(user_id: int, lang: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, lang) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET lang = ?",
+            (user_id, lang, lang),
+        )
 
 
-@router.callback_query(F.data.startswith("cat:"))
-async def show_items(callback: CallbackQuery):
-    cat_id = int(callback.data.split(":")[1])  # CORRECTED INDEX
-    lang = lang_of(callback.from_user.id)
-    category = menu_store.get_category(cat_id)
-    items = menu_store.list_items(cat_id)
-    kb = InlineKeyboardBuilder()
-    for item in items:
-        name = item["name"].get(lang, item["name"]["en"])
-        kb.button(text=f"{name} — {price_range_text(item)}", callback_data=f"item:{item['id']}")
-    kb.button(text="⬅️ Back", callback_data="menu")
-    kb.adjust(1)
-    await callback.message.answer(category["name"].get(lang, category["name"]["en"]), reply_markup=kb.as_markup())
-    await callback.answer()
+def get_user_language(user_id: int) -> str:
+    with get_db() as conn:
+        row = conn.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else "en"
 
 
-@router.callback_query(F.data.startswith("item:"))
-async def choose_temp_or_size(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[1])  # CORRECTED INDEX
-    lang = lang_of(callback.from_user.id)
-    item = menu_store.get_item(item_id)
-    if not item: return await callback.answer()
-    temps = temps_for(item)
-    if len(temps) > 1:
-        kb = InlineKeyboardBuilder()
-        for temp in temps: kb.button(text=t(lang, f"temp_{temp}"), callback_data=f"temp:{item_id}:{temp}")
-        kb.adjust(2)
-        await callback.message.answer(t(lang, "choose_temp"), reply_markup=kb.as_markup())
-    else: await ask_size_or_add(callback, item_id, temps[0])
-    await callback.answer()
+def get_all_user_ids() -> list[int]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+    return [r[0] for r in rows]
 
 
-@router.callback_query(F.data.startswith("temp:"))
-async def choose_size(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    temp = parts[2]
-    await ask_size_or_add(callback, item_id, temp)
-    await callback.answer()
+# ---- loyalty (stamp card) ----
+
+def add_stamp(user_id: int) -> dict:
+    """Call this once per confirmed payment — never before. Returns whether this purchase
+    earned a free item, and whether a previously-expired card was just restarted."""
+    now = now_utc()
+    expired = False
+    earned_free_item = False
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT stamps, first_stamp_at, free_coffee_pending FROM loyalty WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+        if row is None:
+            conn.execute(
+                "INSERT INTO loyalty (user_id, stamps, first_stamp_at) VALUES (?, 1, ?)",
+                (user_id, now.isoformat()),
+            )
+            stamps = 1
+        else:
+            stamps, first_stamp_at, pending = row
+            if pending:
+                # staff already handed over a free coffee at this visit — start fresh
+                stamps = 1
+                conn.execute(
+                    "UPDATE loyalty SET stamps = 1, first_stamp_at = ?, free_coffee_pending = 0 WHERE user_id = ?",
+                    (now.isoformat(), user_id),
+                )
+            elif first_stamp_at and now - datetime.fromisoformat(first_stamp_at) > timedelta(days=CARD_VALID_DAYS):
+                stamps = 1
+                expired = True
+                conn.execute(
+                    "UPDATE loyalty SET stamps = 1, first_stamp_at = ? WHERE user_id = ?",
+                    (now.isoformat(), user_id),
+                )
+            else:
+                stamps += 1
+                conn.execute("UPDATE loyalty SET stamps = ? WHERE user_id = ?", (stamps, user_id))
+
+        if stamps >= STAMPS_FOR_FREE_ITEM:
+            conn.execute(
+                "UPDATE loyalty SET stamps = ?, free_coffee_pending = 1, first_stamp_at = NULL WHERE user_id = ?",
+                (STAMPS_FOR_FREE_ITEM, user_id),
+            )
+            earned_free_item = True
+
+    return {
+        "stamps": STAMPS_FOR_FREE_ITEM if earned_free_item else stamps,
+        "earned_free_item": earned_free_item,
+        "card_expired": expired,
+    }
 
 
-async def ask_size_or_add(callback: CallbackQuery, item_id: int, temp: str):
-    lang = lang_of(callback.from_user.id)
-    item = menu_store.get_item(item_id)
-    sizes = sizes_for(item, temp)
-    if len(sizes) > 1:
-        kb = InlineKeyboardBuilder()
-        for size in sizes:
-            price = price_for(item, temp, size)
-            kb.button(text=f"{size} — {fmt_price(price)} so'm", callback_data=f"size:{item_id}:{temp}:{size or '-'}")
-        kb.adjust(2)
-        await callback.message.answer(t(lang, "choose_size"), reply_markup=kb.as_markup())
-    else: 
-        await maybe_ask_topping(callback, item_id, temp, sizes[0] if sizes else None)
+def get_loyalty_status(user_id: int) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT stamps, first_stamp_at, free_coffee_pending FROM loyalty WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if not row:
+        return None
+    stamps, first_stamp_at, pending = row
+    return {"stamps": stamps, "first_stamp_at": first_stamp_at, "free_coffee_pending": bool(pending)}
 
 
-@router.callback_query(F.data.startswith("size:"))
-async def choose_size_callback(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    temp = parts[2]
-    size = parts[3]
-    await maybe_ask_topping(callback, item_id, temp, None if size == "-" else size)
-    await callback.answer()
+# ---- orders (used to match a payment confirmation back to the right order) ----
+
+def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None,
+                  branch_name: str = None, items_summary: str = None, items_json: str = None, notes: str = None):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes, now_utc().isoformat()),
+        )
 
 
-async def maybe_ask_topping(callback: CallbackQuery, item_id: int, temp: str, size: str | None):
-    lang = lang_of(callback.from_user.id)
-    item = menu_store.get_item(item_id)
-    size_token = size or "-"
-    if item and item["has_topping_option"]:
-        kb = InlineKeyboardBuilder()
-        kb.button(text=t(lang, "add_topping", price=fmt_price(EXTRA_TOPPING_PRICE)), callback_data=f"topping:{item_id}:{temp}:{size_token}:yes")
-        kb.button(text=t(lang, "skip_topping"), callback_data=f"topping:{item_id}:{temp}:{size_token}:no")
-        kb.adjust(1)
-        await callback.message.answer(t(lang, "add_topping", price=fmt_price(EXTRA_TOPPING_PRICE)), reply_markup=kb.as_markup())
-    else: await add_to_cart(callback, item_id, temp, size, topping=False)
+def set_order_gateway_ref(order_id: str, gateway_ref: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET gateway_ref = ? WHERE order_id = ?", (gateway_ref, order_id))
 
 
-@router.callback_query(F.data.startswith("topping:"))
-async def topping_callback(callback: CallbackQuery):
-    parts = callback.data.split(":")
-    item_id = int(parts[1])
-    temp = parts[2]
-    size = parts[3]
-    choice = parts[4]
-    await add_to_cart(callback, item_id, temp, None if size == "-" else size, topping=(choice == "yes"))
-    await callback.answer()
+def mark_order_paid(order_id: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET status = 'paid' WHERE order_id = ?", (order_id,))
 
 
-async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: str | None, topping: bool):
-    user_id = callback.from_user.id
-    lang = lang_of(user_id)
-    item = menu_store.get_item(item_id)
-    if not item: return
-    price = price_for(item, temp, size) + (EXTRA_TOPPING_PRICE if topping else 0)
-    db.add_item_to_cart(user_id, item_id, temp, size, topping, price)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Add More", callback_data="menu")
-    kb.button(text="🛒 View Cart & Pay", callback_data="cart:view")
-    kb.adjust(1)
-    await callback.message.answer(f"✅ Added {item['name'].get(lang, item['name']['en'])} to cart!", reply_markup=kb.as_markup())
+def mark_order_ready_notified(order_id: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET status_notified_ready = 1 WHERE order_id = ?", (order_id,))
 
 
-# ---------- Cart Interface View ----------
+def get_order(order_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, "
+            "items_summary, items_json, notes, status_notified_ready FROM orders WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "order_id": row[0], "user_id": row[1], "total": row[2],
+        "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
+        "phone": row[6], "branch_name": row[7], "items_summary": row[8],
+        "items_json": row[9], "notes": row[10], "status_notified_ready": bool(row[11]),
+    }
 
-@router.callback_query(F.data == "cart:view")
-async def view_cart_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    lang = lang_of(user_id)
 
+def get_recent_orders(user_id: int, limit: int = 5) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT order_id, total, status, branch_name, items_summary, items_json, created_at FROM orders "
+            "WHERE user_id = ? AND status = 'paid' ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {"order_id": r[0], "total": r[1], "status": r[2], "branch_name": r[3],
+         "items_summary": r[4], "items_json": r[5], "created_at": r[6]}
+        for r in rows
+    ]
+
+
+def get_orders_on_date(date_str: str) -> list[dict]:
+    """date_str like '2026-07-24' (UTC)."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT total, items_json FROM orders WHERE status = 'paid' AND created_at LIKE ?",
+            (f"{date_str}%",),
+        ).fetchall()
+    return [{"total": r[0], "items_json": r[1]} for r in rows]
+
+
+def get_orders_since(iso_datetime: str) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT total, items_json FROM orders WHERE status = 'paid' AND created_at >= ?",
+            (iso_datetime,),
+        ).fetchall()
+    return [{"total": r[0], "items_json": r[1]} for r in rows]
+
+
+# ---- settings (simple key/value store — e.g. whether ordering is paused) ----
+
+def get_setting(key: str, default: str = None) -> str:
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+            (key, value, value),
+        )
