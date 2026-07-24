@@ -1,3 +1,4 @@
+
 # handlers.py
 # All the bot's conversation logic lives here: picking a language, browsing
 # the menu, building an order, paying with Click or Payme through Telegram's
@@ -9,7 +10,7 @@ import os
 import time
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, LabeledPrice, PreCheckoutQuery
+from aiogram.types import CallbackQuery, Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -21,6 +22,7 @@ from texts import t
 from menu_data import EXTRA_TOPPING_PRICE
 import menu_store
 import db
+import branches
 
 router = Router()
 
@@ -35,6 +37,8 @@ PROVIDER_TOKENS = {
 
 
 class OrderFlow(StatesGroup):
+    awaiting_contact = State()
+    awaiting_location = State()
     choosing_payment_method = State()  # button-only step; no message handler here on purpose
 
 
@@ -238,7 +242,7 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
-    kb.button(text=t(lang, "checkout_button"), callback_data="checkout")
+    kb.button(text=t(lang, "cart_button"), callback_data="cart")
     kb.adjust(2)
     await callback.message.answer(t(lang, "added_to_cart", item=name), reply_markup=kb.as_markup())
 
@@ -248,12 +252,75 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 CART: dict[int, list[dict]] = {}
 
 
-# ---------- checkout & payment ----------
+def cart_total(user_id: int) -> int:
+    return sum(entry["price"] for entry in CART.get(user_id, []))
+
+
+def cart_lines(cart: list[dict]) -> list[str]:
+    lines = []
+    for entry in cart:
+        parts = [entry["name"]]
+        if entry["size"]:
+            parts.append(entry["size"])
+        if entry["topping"]:
+            parts.append("+ boba")
+        lines.append("• " + " ".join(parts))
+    return lines
+
+
+# ---------- cart viewing & editing ----------
 
 @router.message(Command("cart"))
 async def cart_command(message: Message):
-    await show_cart(message.from_user.id, message.answer)
+    await show_cart_editable(message.from_user.id, message.answer)
 
+
+@router.callback_query(F.data == "cart")
+async def cart_callback(callback: CallbackQuery):
+    await show_cart_editable(callback.from_user.id, callback.message.answer)
+    await callback.answer()
+
+
+async def show_cart_editable(user_id: int, send):
+    lang = lang_of(user_id)
+    cart = CART.get(user_id, [])
+    if not cart:
+        await send(t(lang, "cart_empty"))
+        return
+
+    text = t(lang, "your_order") + "\n" + "\n".join(cart_lines(cart)) + f"\n\n{t(lang, 'total')}: {fmt_price(cart_total(user_id))} so'm"
+
+    kb = InlineKeyboardBuilder()
+    for i, entry in enumerate(cart):
+        label = entry["name"] + (f" {entry['size']}" if entry["size"] else "")
+        kb.button(text=f"🗑 {label}", callback_data=f"cartdel:{i}")
+    kb.button(text=t(lang, "checkout_button"), callback_data="checkout")
+    kb.button(text=t(lang, "clear_cart_button"), callback_data="clearcart")
+    kb.button(text=t(lang, "menu_button"), callback_data="menu")
+    kb.adjust(*([1] * len(cart)), 1, 1, 1)
+
+    await send(text, reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("cartdel:"))
+async def cart_delete_item(callback: CallbackQuery):
+    index = int(callback.data.split(":")[1])
+    cart = CART.get(callback.from_user.id, [])
+    if 0 <= index < len(cart):
+        cart.pop(index)
+    await show_cart_editable(callback.from_user.id, callback.message.answer)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clearcart")
+async def cart_clear(callback: CallbackQuery):
+    lang = lang_of(callback.from_user.id)
+    CART[callback.from_user.id] = []
+    await callback.message.answer(t(lang, "cart_cleared"))
+    await callback.answer()
+
+
+# ---------- checkout & payment ----------
 
 @router.callback_query(F.data == "checkout")
 async def checkout_callback(callback: CallbackQuery, state: FSMContext):
@@ -268,30 +335,75 @@ async def show_cart(user_id: int, send, offer_payment: bool = False, state: FSMC
         await send(t(lang, "cart_empty"))
         return
 
-    lines = []
-    total = 0
-    for entry in cart:
-        parts = [entry["name"]]
-        if entry["size"]:
-            parts.append(entry["size"])
-        if entry["topping"]:
-            parts.append("+ boba")
-        lines.append("• " + " ".join(parts))
-        total += entry["price"]
-
-    text = t(lang, "your_order") + "\n" + "\n".join(lines) + f"\n\n{t(lang, 'total')}: {fmt_price(total)} so'm"
+    total = cart_total(user_id)
+    text = t(lang, "your_order") + "\n" + "\n".join(cart_lines(cart)) + f"\n\n{t(lang, 'total')}: {fmt_price(total)} so'm"
 
     if offer_payment and state is not None:
         await state.set_data({"order_total": total})
-        await state.set_state(OrderFlow.choosing_payment_method)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Click", callback_data="paymethod:click")
-        kb.button(text="Payme", callback_data="paymethod:payme")
-        kb.adjust(2)
+        await state.set_state(OrderFlow.awaiting_contact)
+        contact_kb = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
         await send(text)
-        await send(t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
+        await send(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
     else:
         await send(text)
+
+
+@router.message(OrderFlow.awaiting_contact, F.contact)
+async def contact_received(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    await state.update_data(phone=message.contact.phone_number)
+    await state.set_state(OrderFlow.awaiting_location)
+
+    location_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
+
+
+@router.message(OrderFlow.awaiting_contact)
+async def contact_not_shared(message: Message):
+    lang = lang_of(message.from_user.id)
+    contact_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+
+
+@router.message(OrderFlow.awaiting_location, F.location)
+async def location_received(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    branch = branches.nearest_branch(message.location.latitude, message.location.longitude)
+    await state.update_data(branch_name=branch["name"])
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Click", callback_data="paymethod:click")
+    kb.button(text="Payme", callback_data="paymethod:payme")
+    kb.adjust(2)
+    await message.answer(
+        t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.answer(t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
+    await state.set_state(OrderFlow.choosing_payment_method)
+
+
+@router.message(OrderFlow.awaiting_location)
+async def location_not_shared(message: Message):
+    lang = lang_of(message.from_user.id)
+    location_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
 
 
 @router.callback_query(F.data.startswith("paymethod:"))
@@ -313,7 +425,11 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         await show_cart(callback.from_user.id, callback.message.answer, offer_payment=True, state=state)
         return
     order_id = f"order_{callback.from_user.id}_{int(time.time())}"
-    db.create_order(order_id, callback.from_user.id, total, method)
+    items_summary = "; ".join(cart_lines(CART.get(callback.from_user.id, [])))
+    db.create_order(
+        order_id, callback.from_user.id, total, method,
+        phone=data.get("phone"), branch_name=data.get("branch_name"), items_summary=items_summary,
+    )
     await state.clear()
 
     # Telegram invoice amounts are in the smallest currency unit — for UZS
@@ -367,15 +483,54 @@ async def handle_successful_payment(message: Message):
     result = db.add_stamp(message.from_user.id)
     CART[message.from_user.id] = []
 
+    order = db.get_order(order_id)
     reply = t(lang, "payment_success")
+    if order and order["branch_name"]:
+        reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
     if result["card_expired"]:
         reply += "\n" + t(lang, "card_expired_notice")
     if result["earned_free_item"]:
         reply += "\n" + t(lang, "free_coffee_ready")
     await message.answer(reply, reply_markup=main_menu_keyboard(lang))
 
+    # Staff notification — without this, nobody at the shop knows an order came in.
+    if OWNER_ID and order:
+        customer = message.from_user
+        customer_label = f"@{customer.username}" if customer.username else customer.full_name
+        staff_text = (
+            f"🔔 New order — {fmt_price(order['total'])} so'm ({order['payment_method'].title()})\n"
+            f"{order['items_summary'] or '—'}\n"
+            f"Customer: {customer_label}"
+        )
+        if order["phone"]:
+            staff_text += f"\nPhone: {order['phone']}"
+        if order["branch_name"]:
+            staff_text += f"\nBranch: {order['branch_name']}"
+        try:
+            await message.bot.send_message(OWNER_ID, staff_text)
+        except Exception:
+            pass  # never let a failed staff notification break the customer's confirmation
+
 
 # ---------- loyalty ----------
+
+@router.message(Command("myorders"))
+async def my_orders_command(message: Message):
+    lang = lang_of(message.from_user.id)
+    orders = db.get_recent_orders(message.from_user.id, limit=5)
+    if not orders:
+        await message.answer(t(lang, "no_past_orders"))
+        return
+
+    blocks = []
+    for o in orders:
+        date = o["created_at"][:10]
+        block = f"{date} — {fmt_price(o['total'])} so'm\n{o['items_summary'] or '—'}"
+        if o["branch_name"]:
+            block += f"\n📍 {o['branch_name']}"
+        blocks.append(block)
+    await message.answer(t(lang, "past_orders_header") + "\n\n" + "\n\n".join(blocks))
+
 
 @router.message(Command("stamps"))
 async def stamps_command(message: Message):
