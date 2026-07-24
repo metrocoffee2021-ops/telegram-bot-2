@@ -225,15 +225,3 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 async def view_cart_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     lang = lang_of(user_id)
-
-
-
-
-# ---------- Cart Interface View ----------
-
-
-# ---------- Cart Interface View ----------
-
-
-
-
