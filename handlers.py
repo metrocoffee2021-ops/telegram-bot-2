@@ -1,7 +1,4 @@
 # handlers.py
-# Updated conversation logic: multi-item shopping cart integration, language selection,
-# menu browsing, native checkout processing, and loyalty card logic.
-
 import os
 import time
 import math
@@ -67,7 +64,7 @@ async def start(message: Message):
 
 @router.callback_query(F.data.startswith("lang:"))
 async def set_language(callback: CallbackQuery):
-    lang = callback.data.split(":")[1]  # FIXED: Isolate target string text index
+    lang = callback.data.split(":")[1]  # CORRECTED INDEX
     db.save_user_language(callback.from_user.id, lang)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish / Send Phone Number", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
     await callback.message.answer("Tasdiqlash uchun telefon raqamingizni yuboring:\nPlease share your phone number to verify registration:", reply_markup=kb)
@@ -120,7 +117,7 @@ async def show_categories(user_id: int, send):
 
 @router.callback_query(F.data.startswith("cat:"))
 async def show_items(callback: CallbackQuery):
-    cat_id = int(callback.data.split(":")[1])  # FIXED
+    cat_id = int(callback.data.split(":")[1])  # CORRECTED INDEX
     lang = lang_of(callback.from_user.id)
     category = menu_store.get_category(cat_id)
     items = menu_store.list_items(cat_id)
@@ -136,7 +133,7 @@ async def show_items(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("item:"))
 async def choose_temp_or_size(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[1])  # FIXED
+    item_id = int(callback.data.split(":")[1])  # CORRECTED INDEX
     lang = lang_of(callback.from_user.id)
     item = menu_store.get_item(item_id)
     if not item: return await callback.answer()
@@ -220,6 +217,16 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
     kb.button(text="🛒 View Cart & Pay", callback_data="cart:view")
     kb.adjust(1)
     await callback.message.answer(f"✅ Added {item['name'].get(lang, item['name']['en'])} to cart!", reply_markup=kb.as_markup())
+
+
+# ---------- Cart Interface View ----------
+
+@router.callback_query(F.data == "cart:view")
+async def view_cart_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    lang = lang_of(user_id)
+
+
 
 
 # ---------- Cart Interface View ----------
