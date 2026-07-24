@@ -1,4 +1,3 @@
-
 # handlers.py
 # All the bot's conversation logic lives here: picking a language, browsing
 # the menu, building an order, paying with Click or Payme through Telegram's
@@ -9,7 +8,7 @@
 import os
 import time
 
-from aiogram import Router, F
+from aiogram import Router, 
 from aiogram.types import CallbackQuery, Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
