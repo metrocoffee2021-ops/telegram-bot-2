@@ -1,7 +1,4 @@
 # handlers.py
-# Updated logic: language selection, mobile validation contact checks, GPS tracking,
-# multi-item shopping cart processing, native checkouts, and loyalty card logic.
-
 import os
 import time
 import math
@@ -19,6 +16,8 @@ import db
 
 router = Router()
 OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
+BARISTA_GROUP_ID = int(os.environ.get("BARISTA_GROUP_ID", "0"))
+
 PROVIDER_TOKENS = {
     "click": os.environ.get("CLICK_PROVIDER_TOKEN", ""),
     "payme": os.environ.get("PAYME_PROVIDER_TOKEN", ""),
@@ -27,7 +26,6 @@ PROVIDER_TOKENS = {
 class OrderFlow(StatesGroup):
     choosing_payment_method = State()
 
-# --- Helper Functions ---
 def fmt_price(amount: int) -> str: return f"{amount:_}".replace("_", " ")
 def temps_for(item: dict) -> list[str]: return list(set(v["temp"] for v in item["variants"]))
 def sizes_for(item: dict, temp: str) -> list[str | None]: return [v["size"] for v in item["variants"] if v["temp"] == temp]
@@ -44,11 +42,11 @@ def main_menu_keyboard(lang: str):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
     kb.button(text="🛒 Savatcha / View Cart", callback_data="cart:view")
-    kb.button(text=t(lang, "stamps_button"), callback_data="stamps")
+    kb.button(text="🎁 Stamp Card", callback_data="loyalty:view")
     kb.adjust(2)
     return kb.as_markup()
 
-# ---------- language and onboarding ----------
+# ---------- Onboarding On Start ----------
 
 @router.message(CommandStart())
 async def start(message: Message):
@@ -63,77 +61,46 @@ async def start(message: Message):
 async def set_language(callback: CallbackQuery):
     lang = callback.data.split(":")[1]
     db.save_user_language(callback.from_user.id, lang)
-    
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish / Send Phone Number", request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
-    await callback.message.answer(
-        "Tasdiqlash uchun telefon raqamingizni yuboring:\nPlease share your phone number to verify registration:",
-        reply_markup=kb
-    )
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish / Send Phone Number", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+    await callback.message.answer("Tasdiqlash uchun telefon raqamingizni yuboring:\nPlease share your phone number to verify registration:", reply_markup=kb)
     await callback.answer()
 
 @router.message(F.contact)
 async def handle_contact(message: Message):
     user_id = message.from_user.id
-    phone_number = message.contact.phone_number
-    
     with db.get_db() as conn:
-        conn.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone_number, user_id))
-        
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Joylashuvni yuborish / Send Location", request_location=True)]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
-    await message.answer(
-        "Sizga eng yaqin qahvaxonamizni ko'rsatish uchun joylashuvingizni ulashing:\nPlease send your location to find the closest coffee shop:",
-        reply_markup=kb
-    )
+        conn.execute("UPDATE users SET phone = ? WHERE user_id = ?", (message.contact.phone_number, user_id))
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Joylashuvni yuborish / Send Location", request_location=True)]], resize_keyboard=True, one_time_keyboard=True)
+    await message.answer("Sizga eng yaqin qahvaxonamizni ko'rsatish uchun joylashuvingizni ulashing:\nPlease send your location to find the closest coffee shop:", reply_markup=kb)
 
 @router.message(F.location)
 async def handle_location(message: Message):
     user_id = message.from_user.id
     lang = lang_of(user_id)
-    lat = message.location.latitude
-    lon = message.location.longitude
-    
+    lat, lon = message.location.latitude, message.location.longitude
     db.save_user_location(user_id, lat, lon)
     
-    # Distance utility algorithm logic (Tashkent defaults)
     branch_a_dist = math.sqrt((lat - 41.3113)**2 + (lon - 69.2797)**2)
     branch_b_dist = math.sqrt((lat - 41.3271)**2 + (lon - 69.2434)**2)
     closest_branch = "📍 Metropia Amir Temur" if branch_a_dist < branch_b_dist else "📍 Metropia Chorsu Branch"
     
-    confirm_text = {
-        "uz": f"Rahmat! Sizga eng yaqin filial: {closest_branch}\nEndi buyurtma berishingiz mumkin!",
-        "ru": f"Спасибо! Ближайший филиал: {closest_branch}\nТеперь можно сделать заказ!",
-        "en": f"Thank you! The closest branch to you is: {closest_branch}\nYou can now browse the menu!"
-    }.get(lang, f"Closest branch: {closest_branch}")
-    
+    confirm_text = {"uz": f"Rahmat! Eng yaqin filial: {closest_branch}", "ru": f"Спасибо! Ближайший филиал: {closest_branch}", "en": f"Thank you! Closest branch: {closest_branch}"}.get(lang, closest_branch)
     await message.answer(confirm_text, reply_markup=ReplyKeyboardRemove())
     await message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
 
-# ---------- menu browsing ----------
+# ---------- Menu Browsing ----------
 
 @router.message(Command("menu"))
-async def menu_command(message: Message):
-    await show_categories(message.from_user.id, message.answer)
-
+async def menu_command(message: Message): await show_categories(message.from_user.id, message.answer)
 @router.callback_query(F.data == "menu")
-async def menu_callback(callback: CallbackQuery):
-    await show_categories(callback.from_user.id, callback.message.answer)
-    await callback.answer()
+async def menu_callback(callback: CallbackQuery): await show_categories(callback.from_user.id, callback.message.answer); await callback.answer()
 
 async def show_categories(user_id: int, send):
     lang = lang_of(user_id)
     categories = menu_store.list_categories()
-    if not categories:
-        await send(t(lang, "menu_currently_empty"))
-        return
+    if not categories: await send(t(lang, "menu_currently_empty")); return
     kb = InlineKeyboardBuilder()
-    for cat in categories:
-        kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
+    for cat in categories: kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
     kb.button(text="🛒 View Cart", callback_data="cart:view")
     kb.adjust(2)
     await send(t(lang, "choose_category"), reply_markup=kb.as_markup())
@@ -162,8 +129,7 @@ async def choose_temp_or_size(callback: CallbackQuery):
     temps = temps_for(item)
     if len(temps) > 1:
         kb = InlineKeyboardBuilder()
-        for temp in temps:
-            kb.button(text=t(lang, f"temp_{temp}"), callback_data=f"temp:{item_id}:{temp}")
+        for temp in temps: kb.button(text=t(lang, f"temp_{temp}"), callback_data=f"temp:{item_id}:{temp}")
         kb.adjust(2)
         await callback.message.answer(t(lang, "choose_temp"), reply_markup=kb.as_markup())
     else: await ask_size_or_add(callback, item_id, temps[0])
@@ -179,7 +145,7 @@ async def ask_size_or_add(callback: CallbackQuery, item_id: int, temp: str):
     lang = lang_of(callback.from_user.id)
     item = menu_store.get_item(item_id)
     sizes = sizes_for(item, temp)
-    if len(sizes) > 1 and sizes[0] is not None:
+    if len(sizes) > 1:
         kb = InlineKeyboardBuilder()
         for size in sizes:
             price = price_for(item, temp, size)
@@ -217,10 +183,24 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
     lang = lang_of(user_id)
     item = menu_store.get_item(item_id)
     if not item: return
-    base_price = price_for(item, temp, size)
-    final_price = base_price + (EXTRA_TOPPING_PRICE if topping else 0)
-    
-    db.add_item_to_cart(user_id, item_id, temp, size, topping, final_price)
-    
+    price = price_for(item, temp, size) + (EXTRA_TOPPING_PRICE if topping else 0)
+    db.add_item_to_cart(user_id, item_id, temp, size, topping, price)
     kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Add More Coffee", callback_data="menu")
+    kb.button(text="➕ Add More", callback_data="menu")
+    kb.button(text="🛒 View Cart & Pay", callback_data="cart:view")
+    kb.adjust(1)
+    await callback.message.answer(f"✅ Added {item['name'].get(lang, item['name']['en'])}!", reply_markup=kb.as_markup())
+
+# ---------- Multi-Item Shopping Basket Summary ----------
+
+@router.callback_query(F.data == "cart:view")
+async def view_cart_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    lang = lang_of(user_id)
+    cart_items = db.get_user_cart(user_id)
+    if not cart_items:
+        await callback.message.answer("🛒 Your cart is empty!", reply_markup=main_menu_keyboard(lang))
+        await callback.answer()
+        return
+    summary_text = "🛒 **YOUR CART:**\n\n"
+
