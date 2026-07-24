@@ -146,4 +146,43 @@ def get_loyalty_status(user_id: int) -> dict | None:
 def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None, branch_name: str = None, items_summary: str = None):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, 
+            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, total, payment_method, phone, branch_name, items_summary, now_utc().isoformat()),
+        )
+
+
+def set_order_gateway_ref(order_id: str, gateway_ref: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET gateway_ref = ? WHERE order_id = ?", (gateway_ref, order_id))
+
+
+def mark_order_paid(order_id: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET status = 'paid' WHERE order_id = ?", (order_id,))
+
+
+def get_order(order_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, items_summary FROM orders WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "order_id": row[0], "user_id": row[1], "total": row[2],
+        "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
+        "phone": row[6], "branch_name": row[7], "items_summary": row[8],
+    }
+
+
+def get_recent_orders(user_id: int, limit: int = 5) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT order_id, total, status, branch_name, items_summary, created_at FROM orders "
+            "WHERE user_id = ? AND status = 'paid' ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {"order_id": r[0], "total": r[1], "status": r[2], "branch_name": r[3], "items_summary": r[4], "created_at": r[5]}
+        for r in rows
