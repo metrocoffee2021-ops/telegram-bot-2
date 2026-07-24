@@ -26,7 +26,6 @@ PROVIDER_TOKENS = {
 class OrderFlow(StatesGroup):
     choosing_payment_method = State()
 
-# --- Helper Functions ---
 def fmt_price(amount: int) -> str: return f"{amount:_}".replace("_", " ")
 def temps_for(item: dict) -> list[str]: return list(set(v["temp"] for v in item["variants"]))
 def sizes_for(item: dict, temp: str) -> list[str | None]: return [v["size"] for v in item["variants"] if v["temp"] == temp]
@@ -203,6 +202,4 @@ async def view_cart_handler(callback: CallbackQuery):
         await callback.message.answer("🛒 Your cart is empty!", reply_markup=main_menu_keyboard(lang))
         await callback.answer()
         return
-
-
-
+    summary_text = "🛒 **YOUR CART:**\n\n"
