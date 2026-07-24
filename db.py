@@ -47,6 +47,9 @@ def init_db():
             status TEXT DEFAULT 'pending',
             payment_method TEXT,
             gateway_ref TEXT,
+            phone TEXT,
+            branch_name TEXT,
+            items_summary TEXT,
             created_at TEXT
         )""")
 
@@ -140,33 +143,7 @@ def get_loyalty_status(user_id: int) -> dict | None:
 
 # ---- orders (used to match a payment confirmation back to the right order) ----
 
-def create_order(order_id: str, user_id: int, total: int, payment_method: str):
+def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None, branch_name: str = None, items_summary: str = None):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO orders (order_id, user_id, total, payment_method, created_at) VALUES (?, ?, ?, ?, ?)",
-            (order_id, user_id, total, payment_method, now_utc().isoformat()),
-        )
-
-
-def set_order_gateway_ref(order_id: str, gateway_ref: str):
-    with get_db() as conn:
-        conn.execute("UPDATE orders SET gateway_ref = ? WHERE order_id = ?", (gateway_ref, order_id))
-
-
-def mark_order_paid(order_id: str):
-    with get_db() as conn:
-        conn.execute("UPDATE orders SET status = 'paid' WHERE order_id = ?", (order_id,))
-
-
-def get_order(order_id: str) -> dict | None:
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT order_id, user_id, total, status, payment_method, gateway_ref FROM orders WHERE order_id = ?",
-            (order_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "order_id": row[0], "user_id": row[1], "total": row[2],
-        "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
-    }
+            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, 
