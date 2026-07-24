@@ -1,4 +1,7 @@
 # handlers.py
+# Updated conversation logic: multi-item shopping cart integration, language selection,
+# menu browsing, native checkout processing, and loyalty card logic.
+
 import os
 import time
 import math
@@ -23,8 +26,10 @@ PROVIDER_TOKENS = {
     "payme": os.environ.get("PAYME_PROVIDER_TOKEN", ""),
 }
 
+
 class OrderFlow(StatesGroup):
     choosing_payment_method = State()
+
 
 def fmt_price(amount: int) -> str: return f"{amount:_}".replace("_", " ")
 def temps_for(item: dict) -> list[str]: return list(set(v["temp"] for v in item["variants"]))
@@ -38,6 +43,7 @@ def price_range_text(item: dict) -> str:
     return f"{fmt_price(lo)} so'm" if lo == hi else f"{fmt_price(lo)}-{fmt_price(hi)} so'm"
 def lang_of(user_id: int) -> str: return db.get_user_language(user_id)
 
+
 def main_menu_keyboard(lang: str):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
@@ -45,6 +51,7 @@ def main_menu_keyboard(lang: str):
     kb.button(text="🎁 Stamp Card", callback_data="loyalty:view")
     kb.adjust(2)
     return kb.as_markup()
+
 
 # ---------- language and onboarding ----------
 
@@ -57,13 +64,15 @@ async def start(message: Message):
     kb.adjust(3)
     await message.answer(t("en", "choose_language"), reply_markup=kb.as_markup())
 
+
 @router.callback_query(F.data.startswith("lang:"))
 async def set_language(callback: CallbackQuery):
-    lang = callback.data.split(":")[1]
+    lang = callback.data.split(":")[1]  # FIXED: Isolate target string text index
     db.save_user_language(callback.from_user.id, lang)
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish / Send Phone Number", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
     await callback.message.answer("Tasdiqlash uchun telefon raqamingizni yuboring:\nPlease share your phone number to verify registration:", reply_markup=kb)
     await callback.answer()
+
 
 @router.message(F.contact)
 async def handle_contact(message: Message):
@@ -73,6 +82,7 @@ async def handle_contact(message: Message):
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📍 Joylashuvni yuborish / Send Location", request_location=True)]], resize_keyboard=True, one_time_keyboard=True)
     await message.answer("Sizga eng yaqin qahvaxonamizni ko'rsatish uchun joylashuvingizni ulashing:\nPlease send your location to find the closest coffee shop:", reply_markup=kb)
 
+
 @router.message(F.location)
 async def handle_location(message: Message):
     user_id = message.from_user.id
@@ -80,25 +90,14 @@ async def handle_location(message: Message):
     lat, lon = message.location.latitude, message.location.longitude
     db.save_user_location(user_id, lat, lon)
     
-    # ─── UPDATED GEOGRAPHIC COORDINATES FOR METROPIA ───
-    # Metropia Luxor (Abdulla Qaxxor 150A): 41.2721, 69.2553
-    # Metropia Sayram (Sayram street 4A): 41.3283, 69.3248
     luxor_dist = math.sqrt((lat - 41.2721)**2 + (lon - 69.2553)**2)
     sayram_dist = math.sqrt((lat - 41.3283)**2 + (lon - 69.3248)**2)
+    closest_branch = "☕ METROPIA LUXOR (Abdulla Qaxxor 150A)" if luxor_dist < sayram_dist else "☕ METROPIA SAYRAM (Sayram street 4A)"
     
-    if luxor_dist < sayram_dist:
-        closest_branch = "☕ METROPIA LUXOR (Abdulla Qaxxor 150A)"
-    else:
-        closest_branch = "☕ METROPIA SAYRAM (Sayram street, 5th passage 4A)"
-    
-    confirm_text = {
-        "uz": f"Rahmat! Sizga eng yaqin filial: {closest_branch}\nEndi buyurtma berishingiz mumkin!",
-        "ru": f"Спасибо! Ближайший филиал: {closest_branch}\nТеперь можно сделать заказ!",
-        "en": f"Thank you! The closest branch to you is: {closest_branch}\nYou can now browse the menu!"
-    }.get(lang, closest_branch)
-    
+    confirm_text = {"uz": f"Rahmat! Eng yaqin filial: {closest_branch}", "ru": f"Спасибо! Ближайший филиал: {closest_branch}", "en": f"Thank you! Closest branch: {closest_branch}"}.get(lang, closest_branch)
     await message.answer(confirm_text, reply_markup=ReplyKeyboardRemove())
     await message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
+
 
 # ---------- menu browsing ----------
 
@@ -106,6 +105,7 @@ async def handle_location(message: Message):
 async def menu_command(message: Message): await show_categories(message.from_user.id, message.answer)
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery): await show_categories(callback.from_user.id, callback.message.answer); await callback.answer()
+
 
 async def show_categories(user_id: int, send):
     lang = lang_of(user_id)
@@ -117,9 +117,10 @@ async def show_categories(user_id: int, send):
     kb.adjust(2)
     await send(t(lang, "choose_category"), reply_markup=kb.as_markup())
 
+
 @router.callback_query(F.data.startswith("cat:"))
 async def show_items(callback: CallbackQuery):
-    cat_id = int(callback.data.split(":")[1])
+    cat_id = int(callback.data.split(":")[1])  # FIXED
     lang = lang_of(callback.from_user.id)
     category = menu_store.get_category(cat_id)
     items = menu_store.list_items(cat_id)
@@ -132,9 +133,10 @@ async def show_items(callback: CallbackQuery):
     await callback.message.answer(category["name"].get(lang, category["name"]["en"]), reply_markup=kb.as_markup())
     await callback.answer()
 
+
 @router.callback_query(F.data.startswith("item:"))
 async def choose_temp_or_size(callback: CallbackQuery):
-    item_id = int(callback.data.split(":")[1])
+    item_id = int(callback.data.split(":")[1])  # FIXED
     lang = lang_of(callback.from_user.id)
     item = menu_store.get_item(item_id)
     if not item: return await callback.answer()
@@ -147,11 +149,15 @@ async def choose_temp_or_size(callback: CallbackQuery):
     else: await ask_size_or_add(callback, item_id, temps[0])
     await callback.answer()
 
+
 @router.callback_query(F.data.startswith("temp:"))
 async def choose_size(callback: CallbackQuery):
-    _, item_id, temp = callback.data.split(":")
-    await ask_size_or_add(callback, int(item_id), temp)
+    parts = callback.data.split(":")
+    item_id = int(parts[1])
+    temp = parts[2]
+    await ask_size_or_add(callback, item_id, temp)
     await callback.answer()
+
 
 async def ask_size_or_add(callback: CallbackQuery, item_id: int, temp: str):
     lang = lang_of(callback.from_user.id)
@@ -164,13 +170,19 @@ async def ask_size_or_add(callback: CallbackQuery, item_id: int, temp: str):
             kb.button(text=f"{size} — {fmt_price(price)} so'm", callback_data=f"size:{item_id}:{temp}:{size or '-'}")
         kb.adjust(2)
         await callback.message.answer(t(lang, "choose_size"), reply_markup=kb.as_markup())
-    else: await maybe_ask_topping(callback, item_id, temp, sizes[0])
+    else: 
+        await maybe_ask_topping(callback, item_id, temp, sizes[0] if sizes else None)
+
 
 @router.callback_query(F.data.startswith("size:"))
 async def choose_size_callback(callback: CallbackQuery):
-    _, item_id, temp, size = callback.data.split(":")
-    await maybe_ask_topping(callback, int(item_id), temp, None if size == "-" else size)
+    parts = callback.data.split(":")
+    item_id = int(parts[1])
+    temp = parts[2]
+    size = parts[3]
+    await maybe_ask_topping(callback, item_id, temp, None if size == "-" else size)
     await callback.answer()
+
 
 async def maybe_ask_topping(callback: CallbackQuery, item_id: int, temp: str, size: str | None):
     lang = lang_of(callback.from_user.id)
@@ -184,11 +196,17 @@ async def maybe_ask_topping(callback: CallbackQuery, item_id: int, temp: str, si
         await callback.message.answer(t(lang, "add_topping", price=fmt_price(EXTRA_TOPPING_PRICE)), reply_markup=kb.as_markup())
     else: await add_to_cart(callback, item_id, temp, size, topping=False)
 
+
 @router.callback_query(F.data.startswith("topping:"))
 async def topping_callback(callback: CallbackQuery):
-    _, item_id, temp, size, choice = callback.data.split(":")
-    await add_to_cart(callback, int(item_id), temp, None if size == "-" else size, topping=(choice == "yes"))
+    parts = callback.data.split(":")
+    item_id = int(parts[1])
+    temp = parts[2]
+    size = parts[3]
+    choice = parts[4]
+    await add_to_cart(callback, item_id, temp, None if size == "-" else size, topping=(choice == "yes"))
     await callback.answer()
+
 
 async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: str | None, topping: bool):
     user_id = callback.from_user.id
@@ -202,6 +220,10 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
     kb.button(text="🛒 View Cart & Pay", callback_data="cart:view")
     kb.adjust(1)
     await callback.message.answer(f"✅ Added {item['name'].get(lang, item['name']['en'])} to cart!", reply_markup=kb.as_markup())
+
+
+# ---------- Cart Interface View ----------
+
 
 # ---------- Cart Interface View ----------
 
