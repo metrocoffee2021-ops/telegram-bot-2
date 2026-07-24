@@ -1,15 +1,11 @@
 # db.py
-# All the bot's saved data (which language each customer picked, and their
-# loyalty stamps) lives in one file: metropia.db — created automatically the
-# first time the bot runs. Back this file up along with the rest of the bot.
-
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 DB_PATH = "metropia.db"
-STAMPS_FOR_FREE_ITEM = 10   # buy 9, the 10th is free
-CARD_VALID_DAYS = 30        # valid one month after the first stamp
+STAMPS_FOR_FREE_ITEM = 10   
+CARD_VALID_DAYS = 30        
 
 
 def now_utc() -> datetime:
@@ -92,7 +88,6 @@ def get_all_user_ids() -> list[int]:
 # ---- loyalty (stamp card) ----
 
 def add_stamp(user_id: int) -> dict:
-    """Call this once per confirmed payment — never before."""
     now = now_utc()
     expired = False
     earned_free_item = False
@@ -151,7 +146,6 @@ def get_user_cart(user_id: int) -> list[dict]:
         rows = conn.execute(
             "SELECT cart_id, item_id, temp, size, topping, price FROM cart WHERE user_id = ?", (user_id,)
         ).fetchall()
-    # FIXED: Explicit matrix row coordinate unpacking
     return [
         {
             "cart_id": row[0], 
