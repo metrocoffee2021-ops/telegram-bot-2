@@ -32,7 +32,9 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             lang TEXT DEFAULT 'en',
-            phone TEXT
+            phone TEXT,
+            lat REAL,
+            lon REAL
         )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS loyalty (
             user_id INTEGER PRIMARY KEY,
@@ -49,7 +51,6 @@ def init_db():
             gateway_ref TEXT,
             created_at TEXT
         )""")
-        # New persistent table to hold multiple choices per user before checkout
         conn.execute("""CREATE TABLE IF NOT EXISTS cart (
             cart_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -145,6 +146,13 @@ def get_loyalty_status(user_id: int) -> dict | None:
         return None
     stamps, first_stamp_at, pending = row
     return {"stamps": stamps, "first_stamp_at": first_stamp_at, "free_coffee_pending": bool(pending)}
+
+
+# ---- location and profiles ----
+
+def save_user_location(user_id: int, lat: float, lon: float):
+    with get_db() as conn:
+        conn.execute("UPDATE users SET lat = ?, lon = ? WHERE user_id = ?", (lat, lon, user_id))
 
 
 # ---- shopping cart management ----
