@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
 DB_PATH = "metropia.db"
-
 STAMPS_FOR_FREE_ITEM = 10   
 CARD_VALID_DAYS = 30        
 
@@ -80,12 +79,10 @@ def add_stamp(user_id: int) -> dict:
     now = now_utc()
     expired = False
     earned_free_item = False
-
     with get_db() as conn:
         row = conn.execute(
             "SELECT stamps, first_stamp_at, free_coffee_pending FROM loyalty WHERE user_id = ?", (user_id,)
         ).fetchone()
-
         if row is None:
             conn.execute("INSERT INTO loyalty (user_id, stamps, first_stamp_at) VALUES (?, 1, ?)", (user_id, now.isoformat()))
             stamps = 1
@@ -101,16 +98,10 @@ def add_stamp(user_id: int) -> dict:
             else:
                 stamps += 1
                 conn.execute("UPDATE loyalty SET stamps = ? WHERE user_id = ?", (stamps, user_id))
-
         if stamps >= STAMPS_FOR_FREE_ITEM:
             conn.execute("UPDATE loyalty SET stamps = ?, free_coffee_pending = 1, first_stamp_at = NULL WHERE user_id = ?", (STAMPS_FOR_FREE_ITEM, user_id))
             earned_free_item = True
-
-    return {
-        "stamps": STAMPS_FOR_FREE_ITEM if earned_free_item else stamps,
-        "earned_free_item": earned_free_item,
-        "card_expired": expired,
-    }
+    return {"stamps": STAMPS_FOR_FREE_ITEM if earned_free_item else stamps, "earned_free_item": earned_free_item, "card_expired": expired}
 
 def get_loyalty_status(user_id: int) -> dict:
     with get_db() as conn:
@@ -136,7 +127,7 @@ def get_user_cart(user_id: int) -> list[dict]:
             "SELECT cart_id, item_id, temp, size, topping, price FROM cart WHERE user_id = ?", (user_id,)
         ).fetchall()
     return [
-        {"cart_id": r[0], "item_id": r[1], "temp": r[2], "size": r[3], "topping": bool(r[4]), "price": r[5]}
+        {"cart_id": r[0], "item_id": r[1], "temp": r[2], "size": r[3], "topping": bool(r[4]), "price": int(r[5])}
         for r in rows
     ]
 
@@ -174,7 +165,7 @@ def get_order(order_id: str) -> dict | None:
     return {
         "order_id": row[0],
         "user_id": row[1],
-        "total": row[2],
+        "total": int(row[2]),
         "status": row[3],
         "payment_method": row[4],
         "gateway_ref": row[5]
@@ -183,5 +174,6 @@ def get_order(order_id: str) -> dict | None:
 def delete_pending_order(order_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM orders WHERE order_id = ? AND status = 'pending'", (order_id,))
+
 
 
