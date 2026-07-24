@@ -47,9 +47,6 @@ def init_db():
             status TEXT DEFAULT 'pending',
             payment_method TEXT,
             gateway_ref TEXT,
-            phone TEXT,
-            branch_name TEXT,
-            items_summary TEXT,
             created_at TEXT
         )""")
 
@@ -99,7 +96,6 @@ def add_stamp(user_id: int) -> dict:
         else:
             stamps, first_stamp_at, pending = row
             if pending:
-                # staff already handed over a free coffee at this visit — start fresh
                 stamps = 1
                 conn.execute(
                     "UPDATE loyalty SET stamps = 1, first_stamp_at = ?, free_coffee_pending = 0 WHERE user_id = ?",
@@ -141,13 +137,13 @@ def get_loyalty_status(user_id: int) -> dict | None:
     return {"stamps": stamps, "first_stamp_at": first_stamp_at, "free_coffee_pending": bool(pending)}
 
 
-# ---- orders (used to match a payment confirmation back to the right order) ----
+# ---- orders ----
 
-def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None, branch_name: str = None, items_summary: str = None):
+def create_order(order_id: str, user_id: int, total: int, payment_method: str):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (order_id, user_id, total, payment_method, phone, branch_name, items_summary, now_utc().isoformat()),
+            "INSERT INTO orders (order_id, user_id, total, payment_method, created_at) VALUES (?, ?, ?, ?, ?)",
+            (order_id, user_id, total, payment_method, now_utc().isoformat()),
         )
 
 
@@ -164,25 +160,22 @@ def mark_order_paid(order_id: str):
 def get_order(order_id: str) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, items_summary FROM orders WHERE order_id = ?",
+            "SELECT order_id, user_id, total, status, payment_method, gateway_ref FROM orders WHERE order_id = ?",
             (order_id,),
         ).fetchone()
     if not row:
         return None
     return {
-        "order_id": row[0], "user_id": row[1], "total": row[2],
-        "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
-        "phone": row[6], "branch_name": row[7], "items_summary": row[8],
+        "order_id": row[0],
+        "user_id": row[1],
+        "total": row[2],
+        "status": row[3],
+        "payment_method": row[4],
+        "gateway_ref": row[5]
     }
 
 
-def get_recent_orders(user_id: int, limit: int = 5) -> list[dict]:
+def delete_pending_order(order_id: str):
+    """Permanently removes an unpaid order from the database."""
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT order_id, total, status, branch_name, items_summary, created_at FROM orders "
-            "WHERE user_id = ? AND status = 'paid' ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-    return [
-        {"order_id": r[0], "total": r[1], "status": r[2], "branch_name": r[3], "items_summary": r[4], "created_at": r[5]}
-        for r in rows
+        conn.execute("DELETE FROM orders WHERE order_id = ? AND status = 'pending'", (order_id,))
