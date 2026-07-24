@@ -49,6 +49,16 @@ def init_db():
             gateway_ref TEXT,
             created_at TEXT
         )""")
+        # New persistent table to hold multiple choices per user before checkout
+        conn.execute("""CREATE TABLE IF NOT EXISTS cart (
+            cart_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            item_id INTEGER,
+            temp TEXT,
+            size TEXT,
+            topping INTEGER,
+            price INTEGER
+        )""")
 
 
 # ---- language ----
@@ -135,6 +145,37 @@ def get_loyalty_status(user_id: int) -> dict | None:
         return None
     stamps, first_stamp_at, pending = row
     return {"stamps": stamps, "first_stamp_at": first_stamp_at, "free_coffee_pending": bool(pending)}
+
+
+# ---- shopping cart management ----
+
+def add_item_to_cart(user_id: int, item_id: int, temp: str, size: str | None, topping: bool, price: int):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO cart (user_id, item_id, temp, size, topping, price) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, item_id, temp, size, 1 if topping else 0, price)
+        )
+
+
+def get_user_cart(user_id: int) -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT cart_id, item_id, temp, size, topping, price FROM cart WHERE user_id = ?", (user_id,)
+        ).fetchall()
+    return [
+        {"cart_id": r[0], "item_id": r[1], "temp": r[2], "size": r[3], "topping": bool(r[4]), "price": r[5]}
+        for r in rows
+    ]
+
+
+def remove_cart_item(cart_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM cart WHERE cart_id = ?", (cart_id,))
+
+
+def clear_user_cart(user_id: int):
+    with get_db() as conn:
+        conn.execute("DELETE FROM cart WHERE user_id = ?", (user_id,))
 
 
 # ---- orders ----
