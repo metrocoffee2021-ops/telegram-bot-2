@@ -80,11 +80,23 @@ async def handle_location(message: Message):
     lat, lon = message.location.latitude, message.location.longitude
     db.save_user_location(user_id, lat, lon)
     
-    branch_a_dist = math.sqrt((lat - 41.3113)**2 + (lon - 69.2797)**2)
-    branch_b_dist = math.sqrt((lat - 41.3271)**2 + (lon - 69.2434)**2)
-    closest_branch = "📍 Metropia Amir Temur" if branch_a_dist < branch_b_dist else "📍 Metropia Chorsu Branch"
+    # ─── UPDATED GEOGRAPHIC COORDINATES FOR METROPIA ───
+    # Metropia Luxor (Abdulla Qaxxor 150A): 41.2721, 69.2553
+    # Metropia Sayram (Sayram street 4A): 41.3283, 69.3248
+    luxor_dist = math.sqrt((lat - 41.2721)**2 + (lon - 69.2553)**2)
+    sayram_dist = math.sqrt((lat - 41.3283)**2 + (lon - 69.3248)**2)
     
-    confirm_text = {"uz": f"Rahmat! Eng yaqin filial: {closest_branch}", "ru": f"Спасибо! Ближайший филиал: {closest_branch}", "en": f"Thank you! Closest branch: {closest_branch}"}.get(lang, closest_branch)
+    if luxor_dist < sayram_dist:
+        closest_branch = "☕ METROPIA LUXOR (Abdulla Qaxxor 150A)"
+    else:
+        closest_branch = "☕ METROPIA SAYRAM (Sayram street, 5th passage 4A)"
+    
+    confirm_text = {
+        "uz": f"Rahmat! Sizga eng yaqin filial: {closest_branch}\nEndi buyurtma berishingiz mumkin!",
+        "ru": f"Спасибо! Ближайший филиал: {closest_branch}\nТеперь можно сделать заказ!",
+        "en": f"Thank you! The closest branch to you is: {closest_branch}\nYou can now browse the menu!"
+    }.get(lang, closest_branch)
+    
     await message.answer(confirm_text, reply_markup=ReplyKeyboardRemove())
     await message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
 
@@ -193,13 +205,4 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 
 # ---------- Cart Interface View ----------
 
-@router.callback_query(F.data == "cart:view")
-async def view_cart_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    lang = lang_of(user_id)
-    cart_items = db.get_user_cart(user_id)
-    if not cart_items:
-        await callback.message.answer("🛒 Your cart is empty!", reply_markup=main_menu_keyboard(lang))
-        await callback.answer()
-        return
-    summary_text = "🛒 **YOUR CART:**\n\n"
+
