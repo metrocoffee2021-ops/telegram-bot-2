@@ -418,7 +418,8 @@ async def notes_received(message: Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text="Click", callback_data="paymethod:click")
     kb.button(text="Payme", callback_data="paymethod:payme")
-    kb.adjust(2)
+    kb.button(text=t(lang, "cash_payment_button"), callback_data="paymethod:cash")
+    kb.adjust(2, 1)
     await message.answer(t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
     await state.set_state(OrderFlow.choosing_payment_method)
 
@@ -438,11 +439,6 @@ async def location_not_shared(message: Message):
 async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     method = callback.data.split(":")[1]
     lang = lang_of(callback.from_user.id)
-    provider_token = PROVIDER_TOKENS.get(method, "")
-
-    if not provider_token:
-        await callback.answer(t(lang, "payment_error"), show_alert=True)
-        return
 
     data = await state.get_data()
     total = data.get("order_total")
@@ -452,6 +448,7 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         await callback.answer(t(lang, "payment_error"), show_alert=True)
         await show_cart(callback.from_user.id, callback.message.answer, offer_payment=True, state=state)
         return
+
     order_id = f"order_{callback.from_user.id}_{int(time.time())}"
     cart_snapshot = CART.get(callback.from_user.id, [])
     items_summary = "; ".join(cart_lines(cart_snapshot))
@@ -461,6 +458,15 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         items_json=json.dumps(cart_snapshot), notes=data.get("notes"),
     )
     await state.clear()
+
+    if method == "cash":
+        await handle_cash_checkout(callback, order_id, lang)
+        return
+
+    provider_token = PROVIDER_TOKENS.get(method, "")
+    if not provider_token:
+        await callback.answer(t(lang, "payment_error"), show_alert=True)
+        return
 
     # Telegram invoice amounts are in the smallest currency unit — for UZS
     # that's tiyin (1 so'm = 100 tiyin), same as Payme's own API. Getting
@@ -487,6 +493,71 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         return
 
     await callback.answer()
+
+
+async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str):
+    """Cash orders are NOT marked paid and get NO stamp yet — staff must confirm
+    they actually received the money first. This is the one place a shortcut
+    would let someone claim stamps for a payment that never happened."""
+    order = db.get_order(order_id)
+    notify_chat_id = STAFF_GROUP_ID or OWNER_ID
+    customer_label = order_customer_label(order)
+
+    if notify_chat_id:
+        kb = InlineKeyboardBuilder()
+        kb.button(text=t(lang, "cash_confirm_received_button"), callback_data=f"cashconfirm:{order_id}")
+        ticket_text = build_staff_order_text(order, "—", customer_label, status_line=t(lang, "cash_awaiting_confirmation"))
+        try:
+            await callback.bot.send_message(notify_chat_id, ticket_text, reply_markup=kb.as_markup())
+        except Exception as e:
+            print(f"[cash-checkout] FAILED to notify chat_id={notify_chat_id}: {e}")
+
+    await callback.message.answer(t(lang, "cash_order_placed_customer"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cashconfirm:"))
+async def cash_checkout_confirm(callback: CallbackQuery):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    order_id = callback.data.split(":", 1)[1]
+    order = db.get_order(order_id)
+    if not order or order["status"] == "paid":
+        await callback.answer()
+        return
+
+    db.mark_order_paid(order_id)
+    today_str = db.now_utc().strftime("%Y-%m-%d")
+    ticket_number = db.assign_order_number(order_id, today_str)
+    result = db.add_stamp(order["user_id"])
+    order = db.get_order(order_id)
+
+    staff_name = callback.from_user.full_name
+    customer_label = order_customer_label(order)
+    confirm_kb = InlineKeyboardBuilder()
+    confirm_kb.button(text="✅ Confirm order", callback_data=f"claim:{order_id}")
+    await callback.message.edit_text(
+        build_staff_order_text(order, ticket_number, customer_label, status_line=f"💵 Cash confirmed — {staff_name}"),
+        reply_markup=confirm_kb.as_markup(),
+    )
+
+    customer_lang = lang_of(order["user_id"])
+    try:
+        notice = t(customer_lang, "cash_order_confirmed_customer", number=ticket_number)
+        if order["branch_name"]:
+            notice += "\n" + t(customer_lang, "pickup_reminder", branch=order["branch_name"])
+        if result["earned_free_item"]:
+            notice += "\n" + t(customer_lang, "free_coffee_ready")
+        elif result["card_expired"]:
+            notice += "\n" + t(customer_lang, "card_expired_notice")
+        await callback.bot.send_message(order["user_id"], notice)
+    except Exception:
+        pass  # customer may have blocked the bot
+
+    await callback.answer()
+
+
 
 
 @router.pre_checkout_query()
@@ -601,6 +672,35 @@ async def test_group_notification(message: Message):
         await message.answer(f"❌ Failed to send to: {target}\n\nError: {e}")
 
 
+async def record_cash_payment(bot, customer_id: int, amount: int, description: str, staff_reply_send, staff_lang: str):
+    """Shared by /cash and the button-based flow — records the sale, adds the
+    stamp, replies to staff, and quietly notifies the customer."""
+    order_id = f"cash_{customer_id}_{int(time.time())}"
+    db.create_order(order_id, customer_id, amount, "cash", items_summary=description)
+    db.mark_order_paid(order_id)
+    today_str = db.now_utc().strftime("%Y-%m-%d")
+    ticket_number = db.assign_order_number(order_id, today_str)
+    result = db.add_stamp(customer_id)
+
+    reply = t(staff_lang, "cash_recorded", number=ticket_number, amount=fmt_price(amount))
+    if result["earned_free_item"]:
+        reply += "\n" + t(staff_lang, "cash_customer_earned_free")
+    elif result["card_expired"]:
+        reply += "\n" + t(staff_lang, "cash_customer_card_restarted")
+    else:
+        reply += "\n" + t(staff_lang, "cash_customer_stamps", stamps=result["stamps"], total=db.STAMPS_FOR_FREE_ITEM)
+    await staff_reply_send(reply)
+
+    try:
+        customer_lang = lang_of(customer_id)
+        notice = t(customer_lang, "cash_stamp_notice_customer")
+        if result["earned_free_item"]:
+            notice += "\n" + t(customer_lang, "free_coffee_ready")
+        await bot.send_message(customer_id, notice)
+    except Exception:
+        pass  # customer may never have started the bot themselves — the stamp is still recorded
+
+
 @router.message(Command("cash"))
 async def cash_order(message: Message):
     lang = lang_of(message.from_user.id)
@@ -635,31 +735,7 @@ async def cash_order(message: Message):
         return
 
     description = parts[3] if len(parts) > 3 else t(lang, "cash_order_default_desc")
-    order_id = f"cash_{customer_id}_{int(time.time())}"
-    db.create_order(order_id, customer_id, amount, "cash", items_summary=description)
-    db.mark_order_paid(order_id)
-    today_str = db.now_utc().strftime("%Y-%m-%d")
-    ticket_number = db.assign_order_number(order_id, today_str)
-    result = db.add_stamp(customer_id)
-
-    reply = t(lang, "cash_recorded", number=ticket_number, amount=fmt_price(amount))
-    if result["earned_free_item"]:
-        reply += "\n" + t(lang, "cash_customer_earned_free")
-    elif result["card_expired"]:
-        reply += "\n" + t(lang, "cash_customer_card_restarted")
-    else:
-        reply += "\n" + t(lang, "cash_customer_stamps", stamps=result["stamps"], total=db.STAMPS_FOR_FREE_ITEM)
-    await message.answer(reply)
-
-    # Let the customer see it on their own loyalty card too, if they can be reached.
-    try:
-        customer_lang = lang_of(customer_id)
-        notice = t(customer_lang, "cash_stamp_notice_customer")
-        if result["earned_free_item"]:
-            notice += "\n" + t(customer_lang, "free_coffee_ready")
-        await message.bot.send_message(customer_id, notice)
-    except Exception:
-        pass  # customer may never have started the bot themselves — the stamp is still recorded
+    await record_cash_payment(message.bot, customer_id, amount, description, message.answer, lang)
 
 
 @router.callback_query(F.data.startswith("claim:"))
@@ -771,12 +847,16 @@ async def show_stamps(user_id: int, send):
     username = db.get_username(user_id)
     code_line = t(lang, "loyalty_code_line", code=f"@{username}" if username else user_id)
 
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "pay_cash_button"), callback_data="cashrequest")
+    markup = kb.as_markup()
+
     if not status:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet") + "\n\n" + code_line)
+        await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet") + "\n\n" + code_line, reply_markup=markup)
         return
 
     if status["free_coffee_pending"]:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready") + "\n\n" + code_line)
+        await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready") + "\n\n" + code_line, reply_markup=markup)
         return
 
     stamps = status["stamps"]
@@ -786,7 +866,68 @@ async def show_stamps(user_id: int, send):
         expires = datetime.fromisoformat(status["first_stamp_at"]) + timedelta(days=db.CARD_VALID_DAYS)
         text += t(lang, "stamps_valid_until", date=expires.strftime("%d.%m.%Y"))
     text += "\n\n" + code_line
-    await send(text)
+    await send(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "cashrequest")
+async def cash_request(callback: CallbackQuery):
+    lang = lang_of(callback.from_user.id)
+    notify_chat_id = STAFF_GROUP_ID or OWNER_ID
+    if not notify_chat_id:
+        await callback.answer()
+        return
+
+    customer_label = order_customer_label({"user_id": callback.from_user.id})
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "cash_enter_amount_button"), callback_data=f"cashamount:{callback.from_user.id}")
+    try:
+        await callback.bot.send_message(
+            notify_chat_id,
+            t(lang, "cash_request_staff_text", customer=customer_label),
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer(t(lang, "cash_request_sent_customer"))
+    except Exception as e:
+        print(f"[cash-request] FAILED to notify chat_id={notify_chat_id}: {e}")
+        await callback.answer(t(lang, "payment_error"), show_alert=True)
+
+
+class CashFlow(StatesGroup):
+    awaiting_amount = State()
+
+
+@router.callback_query(F.data.startswith("cashamount:"))
+async def cash_amount_start(callback: CallbackQuery, state: FSMContext):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    lang = lang_of(callback.from_user.id)
+    customer_id = int(callback.data.split(":", 1)[1])
+    await state.set_data({"customer_id": customer_id})
+    await state.set_state(CashFlow.awaiting_amount)
+    await callback.message.answer(t(lang, "cash_send_amount_prompt"))
+    await callback.answer()
+
+
+@router.message(CashFlow.awaiting_amount)
+async def cash_amount_received(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    if not is_staff_message(message):
+        return  # neutral state — don't let a random group message misfire this
+
+    parts = (message.text or "").split(maxsplit=1)
+    try:
+        amount = int(parts[0].replace(" ", "").replace(",", ""))
+        if amount <= 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await message.answer(t(lang, "cash_invalid_amount"))
+        return  # stay in the same state so they can just retype it
+
+    description = parts[1] if len(parts) > 1 else t(lang, "cash_order_default_desc")
+    data = await state.get_data()
+    await state.clear()
+    await record_cash_payment(message.bot, data["customer_id"], amount, description, message.answer, lang)
 
 
 # ---------- broadcast (owner only) ----------
