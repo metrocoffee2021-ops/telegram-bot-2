@@ -528,48 +528,84 @@ async def handle_successful_payment(message: Message):
     # Staff notification — without this, nobody at the shop knows an order came in.
     notify_chat_id = STAFF_GROUP_ID or OWNER_ID
     if notify_chat_id and order:
-        customer = message.from_user
-        customer_label = f"@{customer.username}" if customer.username else customer.full_name
+        customer_label = order_customer_label(order)
         staff_text = build_staff_order_text(order, ticket_number, customer_label)
         try:
             staff_kb = InlineKeyboardBuilder()
-            staff_kb.button(text="🧑‍🍳 Start preparing", callback_data=f"claim:{order_id}")
+            staff_kb.button(text="✅ Confirm order", callback_data=f"claim:{order_id}")
             await message.bot.send_message(notify_chat_id, staff_text, reply_markup=staff_kb.as_markup())
-        except Exception:
-            pass  # never let a failed staff notification break the customer's confirmation
+        except Exception as e:
+            print(f"[staff-notify] FAILED to send to chat_id={notify_chat_id}: {e}")
+
+
+def order_customer_label(order: dict) -> str:
+    username = db.get_username(order["user_id"])
+    return f"@{username}" if username else f"ID {order['user_id']}"
 
 
 def build_staff_order_text(order: dict, ticket_number: int, customer_label: str, status_line: str = None) -> str:
-    text = (
-        f"🔔 Order #{ticket_number} — {fmt_price(order['total'])} so'm ({order['payment_method'].title()})\n"
-        f"{order['items_summary'] or '—'}\n"
-        f"Customer: {customer_label}"
-    )
+    divider = "──────────────"
+    items = order["items_summary"] or "—"
+    lines = [
+        f"🧾 ORDER #{ticket_number}",
+        divider,
+        items,
+        divider,
+        f"💰 {fmt_price(order['total'])} so'm  •  {order['payment_method'].title()}",
+        f"👤 {customer_label}",
+    ]
     if order["phone"]:
-        text += f"\nPhone: {order['phone']}"
+        lines.append(f"📞 {order['phone']}")
     if order["branch_name"]:
-        text += f"\nBranch: {order['branch_name']}"
+        lines.append(f"📍 {order['branch_name']}")
     if order["notes"]:
-        text += f"\nNote: {order['notes']}"
+        lines.append(f"📝 {order['notes']}")
     if status_line:
-        text += f"\n\n{status_line}"
-    return text
+        lines.append(divider)
+        lines.append(status_line)
+    return "\n".join(lines)
+
+
+def is_order_staff(chat_id: int) -> bool:
+    """Authorization for order-floor actions (confirm/ready/cash stamps).
+    Once a staff group is configured, THIS IS THE ONLY PLACE these work —
+    not the owner's personal chat — so customer and staff activity never mix
+    in the same conversation. Falls back to the owner's DM only if no staff
+    group has been set up yet (e.g. still in initial setup)."""
+    if STAFF_GROUP_ID:
+        return chat_id == STAFF_GROUP_ID
+    return chat_id == OWNER_ID
 
 
 def is_staff(callback: CallbackQuery) -> bool:
-    # Trusted if it's the owner, OR the tap came from inside the staff group itself
-    # (anyone who can tap a button in that group is a barista, not a random customer).
-    return callback.from_user.id == OWNER_ID or (STAFF_GROUP_ID and callback.message.chat.id == STAFF_GROUP_ID)
+    return is_order_staff(callback.message.chat.id)
 
 
 def is_staff_message(message: Message) -> bool:
-    return message.from_user.id == OWNER_ID or (STAFF_GROUP_ID and message.chat.id == STAFF_GROUP_ID)
+    return is_order_staff(message.chat.id)
+
+
+@router.message(Command("testgroup"))
+async def test_group_notification(message: Message):
+    """Owner-only diagnostic — sends a test message to wherever order notifications
+    are configured to go, and reports exactly what happened. Use this instead of
+    placing a real order when checking if the staff group connection works."""
+    if message.from_user.id != OWNER_ID:
+        return
+    notify_chat_id = STAFF_GROUP_ID or OWNER_ID
+    target = f"STAFF_GROUP_ID ({STAFF_GROUP_ID})" if STAFF_GROUP_ID else f"your DM (no STAFF_GROUP_ID set, OWNER_TELEGRAM_ID={OWNER_ID})"
+    try:
+        await message.bot.send_message(notify_chat_id, "🧪 Test message — if you see this in the right place, the connection works.")
+        await message.answer(f"✅ Sent successfully to: {target}")
+    except Exception as e:
+        await message.answer(f"❌ Failed to send to: {target}\n\nError: {e}")
 
 
 @router.message(Command("cash"))
 async def cash_order(message: Message):
     lang = lang_of(message.from_user.id)
     if not is_staff_message(message):
+        await message.answer(t(lang, "not_authorized"))
         return
 
     parts = message.text.split(maxsplit=3)
@@ -639,11 +675,11 @@ async def claim_order(callback: CallbackQuery):
         return
 
     order = db.get_order(order_id)
-    base_text = callback.message.text.split("\n\n🧑‍🍳")[0].split("\n\n✅")[0]  # strip any prior status line
+    customer_label = order_customer_label(order)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Mark ready", callback_data=f"markready:{order_id}")
     await callback.message.edit_text(
-        base_text + f"\n\n🧑‍🍳 Preparing — {staff_name}",
+        build_staff_order_text(order, order["order_number"], customer_label, status_line=f"☑️ Confirmed — {staff_name}"),
         reply_markup=kb.as_markup(),
     )
     await callback.answer()
@@ -669,8 +705,10 @@ async def mark_order_ready(callback: CallbackQuery):
         pass  # customer may have blocked the bot
 
     staff_name = order["claimed_by_name"] or callback.from_user.full_name
-    base_text = callback.message.text.split("\n\n🧑‍🍳")[0].split("\n\n✅")[0]
-    await callback.message.edit_text(base_text + f"\n\n✅ Ready — {staff_name}")
+    customer_label = order_customer_label(order)
+    await callback.message.edit_text(
+        build_staff_order_text(order, order["order_number"], customer_label, status_line=f"✅ Ready — {staff_name}")
+    )
     await callback.answer()
 
 
