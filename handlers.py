@@ -27,6 +27,7 @@ import branches
 router = Router()
 
 OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
+STAFF_GROUP_ID = int(os.environ.get("STAFF_GROUP_ID", "0"))
 
 # Telegram's native payment provider tokens, obtained via @BotFather > Payments.
 # Format looks like "333605228:LIVE:xxxx" — nothing like a merchant API key.
@@ -97,6 +98,7 @@ def main_menu_keyboard(lang: str):
 
 @router.message(CommandStart())
 async def start(message: Message):
+    db.save_username(message.from_user.id, message.from_user.username)
     kb = InlineKeyboardBuilder()
     kb.button(text="O'zbek", callback_data="lang:uz")
     kb.button(text="Русский", callback_data="lang:ru")
@@ -109,6 +111,7 @@ async def start(message: Message):
 async def set_language(callback: CallbackQuery):
     lang = callback.data.split(":")[1]
     db.save_user_language(callback.from_user.id, lang)
+    db.save_username(callback.from_user.id, callback.from_user.username)
     await callback.message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
     await callback.answer()
 
@@ -507,11 +510,13 @@ async def handle_successful_payment(message: Message):
 
     db.set_order_gateway_ref(order_id, payment.telegram_payment_charge_id)
     db.mark_order_paid(order_id)
+    today_str = db.now_utc().strftime("%Y-%m-%d")
+    ticket_number = db.assign_order_number(order_id, today_str)
     result = db.add_stamp(message.from_user.id)
     CART[message.from_user.id] = []
 
     order = db.get_order(order_id)
-    reply = t(lang, "payment_success")
+    reply = t(lang, "payment_success", number=ticket_number)
     if order and order["branch_name"]:
         reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
     if result["card_expired"]:
@@ -521,31 +526,133 @@ async def handle_successful_payment(message: Message):
     await message.answer(reply, reply_markup=main_menu_keyboard(lang))
 
     # Staff notification — without this, nobody at the shop knows an order came in.
-    if OWNER_ID and order:
+    notify_chat_id = STAFF_GROUP_ID or OWNER_ID
+    if notify_chat_id and order:
         customer = message.from_user
         customer_label = f"@{customer.username}" if customer.username else customer.full_name
-        staff_text = (
-            f"🔔 New order — {fmt_price(order['total'])} so'm ({order['payment_method'].title()})\n"
-            f"{order['items_summary'] or '—'}\n"
-            f"Customer: {customer_label}"
-        )
-        if order["phone"]:
-            staff_text += f"\nPhone: {order['phone']}"
-        if order["branch_name"]:
-            staff_text += f"\nBranch: {order['branch_name']}"
-        if order["notes"]:
-            staff_text += f"\nNote: {order['notes']}"
+        staff_text = build_staff_order_text(order, ticket_number, customer_label)
         try:
             staff_kb = InlineKeyboardBuilder()
-            staff_kb.button(text="✅ Ready for pickup", callback_data=f"markready:{order_id}")
-            await message.bot.send_message(OWNER_ID, staff_text, reply_markup=staff_kb.as_markup())
+            staff_kb.button(text="🧑‍🍳 Start preparing", callback_data=f"claim:{order_id}")
+            await message.bot.send_message(notify_chat_id, staff_text, reply_markup=staff_kb.as_markup())
         except Exception:
             pass  # never let a failed staff notification break the customer's confirmation
 
 
+def build_staff_order_text(order: dict, ticket_number: int, customer_label: str, status_line: str = None) -> str:
+    text = (
+        f"🔔 Order #{ticket_number} — {fmt_price(order['total'])} so'm ({order['payment_method'].title()})\n"
+        f"{order['items_summary'] or '—'}\n"
+        f"Customer: {customer_label}"
+    )
+    if order["phone"]:
+        text += f"\nPhone: {order['phone']}"
+    if order["branch_name"]:
+        text += f"\nBranch: {order['branch_name']}"
+    if order["notes"]:
+        text += f"\nNote: {order['notes']}"
+    if status_line:
+        text += f"\n\n{status_line}"
+    return text
+
+
+def is_staff(callback: CallbackQuery) -> bool:
+    # Trusted if it's the owner, OR the tap came from inside the staff group itself
+    # (anyone who can tap a button in that group is a barista, not a random customer).
+    return callback.from_user.id == OWNER_ID or (STAFF_GROUP_ID and callback.message.chat.id == STAFF_GROUP_ID)
+
+
+def is_staff_message(message: Message) -> bool:
+    return message.from_user.id == OWNER_ID or (STAFF_GROUP_ID and message.chat.id == STAFF_GROUP_ID)
+
+
+@router.message(Command("cash"))
+async def cash_order(message: Message):
+    lang = lang_of(message.from_user.id)
+    if not is_staff_message(message):
+        return
+
+    parts = message.text.split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(t(lang, "cash_usage"))
+        return
+
+    identifier = parts[1]
+    if identifier.startswith("@"):
+        customer_id = db.get_user_id_by_username(identifier)
+        if customer_id is None:
+            await message.answer(t(lang, "cash_username_not_found", username=identifier))
+            return
+    else:
+        try:
+            customer_id = int(identifier)
+        except ValueError:
+            await message.answer(t(lang, "cash_usage"))
+            return
+
+    try:
+        amount = int(parts[2].replace(" ", "").replace(",", ""))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(t(lang, "cash_usage"))
+        return
+
+    description = parts[3] if len(parts) > 3 else t(lang, "cash_order_default_desc")
+    order_id = f"cash_{customer_id}_{int(time.time())}"
+    db.create_order(order_id, customer_id, amount, "cash", items_summary=description)
+    db.mark_order_paid(order_id)
+    today_str = db.now_utc().strftime("%Y-%m-%d")
+    ticket_number = db.assign_order_number(order_id, today_str)
+    result = db.add_stamp(customer_id)
+
+    reply = t(lang, "cash_recorded", number=ticket_number, amount=fmt_price(amount))
+    if result["earned_free_item"]:
+        reply += "\n" + t(lang, "cash_customer_earned_free")
+    elif result["card_expired"]:
+        reply += "\n" + t(lang, "cash_customer_card_restarted")
+    else:
+        reply += "\n" + t(lang, "cash_customer_stamps", stamps=result["stamps"], total=db.STAMPS_FOR_FREE_ITEM)
+    await message.answer(reply)
+
+    # Let the customer see it on their own loyalty card too, if they can be reached.
+    try:
+        customer_lang = lang_of(customer_id)
+        notice = t(customer_lang, "cash_stamp_notice_customer")
+        if result["earned_free_item"]:
+            notice += "\n" + t(customer_lang, "free_coffee_ready")
+        await message.bot.send_message(customer_id, notice)
+    except Exception:
+        pass  # customer may never have started the bot themselves — the stamp is still recorded
+
+
+@router.callback_query(F.data.startswith("claim:"))
+async def claim_order(callback: CallbackQuery):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    order_id = callback.data.split(":", 1)[1]
+    staff_name = callback.from_user.full_name
+
+    if not db.claim_order(order_id, staff_name):
+        await callback.answer(t(lang_of(callback.from_user.id), "order_already_claimed"), show_alert=True)
+        return
+
+    order = db.get_order(order_id)
+    base_text = callback.message.text.split("\n\n🧑‍🍳")[0].split("\n\n✅")[0]  # strip any prior status line
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Mark ready", callback_data=f"markready:{order_id}")
+    await callback.message.edit_text(
+        base_text + f"\n\n🧑‍🍳 Preparing — {staff_name}",
+        reply_markup=kb.as_markup(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("markready:"))
 async def mark_order_ready(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
+    if not is_staff(callback):
+        await callback.answer()
         return
     order_id = callback.data.split(":", 1)[1]
     order = db.get_order(order_id)
@@ -554,13 +661,19 @@ async def mark_order_ready(callback: CallbackQuery):
         return
 
     db.mark_order_ready_notified(order_id)
+    db.mark_order_prep_ready(order_id)
     customer_lang = lang_of(order["user_id"])
     try:
         await callback.bot.send_message(order["user_id"], t(customer_lang, "order_ready_notice"))
     except Exception:
         pass  # customer may have blocked the bot
-    await callback.message.edit_text(callback.message.text + "\n\n✅ Marked ready — customer notified.")
+
+    staff_name = order["claimed_by_name"] or callback.from_user.full_name
+    base_text = callback.message.text.split("\n\n🧑‍🍳")[0].split("\n\n✅")[0]
+    await callback.message.edit_text(base_text + f"\n\n✅ Ready — {staff_name}")
     await callback.answer()
+
+
 
 
 # ---------- loyalty ----------
@@ -617,13 +730,15 @@ async def stamps_callback(callback: CallbackQuery):
 async def show_stamps(user_id: int, send):
     lang = lang_of(user_id)
     status = db.get_loyalty_status(user_id)
+    username = db.get_username(user_id)
+    code_line = t(lang, "loyalty_code_line", code=f"@{username}" if username else user_id)
 
     if not status:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet"))
+        await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet") + "\n\n" + code_line)
         return
 
     if status["free_coffee_pending"]:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready"))
+        await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready") + "\n\n" + code_line)
         return
 
     stamps = status["stamps"]
@@ -632,6 +747,7 @@ async def show_stamps(user_id: int, send):
     if status["first_stamp_at"]:
         expires = datetime.fromisoformat(status["first_stamp_at"]) + timedelta(days=db.CARD_VALID_DAYS)
         text += t(lang, "stamps_valid_until", date=expires.strftime("%d.%m.%Y"))
+    text += "\n\n" + code_line
     await send(text)
 
 

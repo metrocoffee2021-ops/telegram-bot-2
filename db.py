@@ -71,6 +71,10 @@ def init_db():
         _add_column_if_missing(conn, "orders", "notes", "TEXT")
         _add_column_if_missing(conn, "orders", "items_json", "TEXT")
         _add_column_if_missing(conn, "orders", "status_notified_ready", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "orders", "order_number", "INTEGER")
+        _add_column_if_missing(conn, "orders", "prep_status", "TEXT DEFAULT 'new'")
+        _add_column_if_missing(conn, "orders", "claimed_by_name", "TEXT")
+        _add_column_if_missing(conn, "users", "username", "TEXT")
 
 
 # ---- language ----
@@ -81,6 +85,31 @@ def save_user_language(user_id: int, lang: str):
             "INSERT INTO users (user_id, lang) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET lang = ?",
             (user_id, lang, lang),
         )
+
+
+def save_username(user_id: int, username: str):
+    """username without the @ — call this whenever we see the user, so staff
+    can later look them up by @handle instead of needing their numeric ID."""
+    if not username:
+        return
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, username) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET username = ?",
+            (user_id, username, username),
+        )
+
+
+def get_user_id_by_username(username: str) -> int | None:
+    username = username.lstrip("@")
+    with get_db() as conn:
+        row = conn.execute("SELECT user_id FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone()
+    return row[0] if row else None
+
+
+def get_username(user_id: int) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT username FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
 
 
 def get_user_language(user_id: int) -> str:
@@ -191,7 +220,8 @@ def get_order(order_id: str) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
             "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, "
-            "items_summary, items_json, notes, status_notified_ready FROM orders WHERE order_id = ?",
+            "items_summary, items_json, notes, status_notified_ready, order_number, prep_status, claimed_by_name "
+            "FROM orders WHERE order_id = ?",
             (order_id,),
         ).fetchone()
     if not row:
@@ -201,7 +231,40 @@ def get_order(order_id: str) -> dict | None:
         "status": row[3], "payment_method": row[4], "gateway_ref": row[5],
         "phone": row[6], "branch_name": row[7], "items_summary": row[8],
         "items_json": row[9], "notes": row[10], "status_notified_ready": bool(row[11]),
+        "order_number": row[12], "prep_status": row[13], "claimed_by_name": row[14],
     }
+
+
+def assign_order_number(order_id: str, today_str: str) -> int:
+    """Called once, right after payment succeeds — gives the order a short daily
+    ticket number (#1, #2, ...) instead of showing staff the long internal order_id."""
+    with get_db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status = 'paid' AND created_at LIKE ? AND order_number IS NOT NULL",
+            (f"{today_str}%",),
+        ).fetchone()[0]
+        number = count + 1
+        conn.execute("UPDATE orders SET order_number = ? WHERE order_id = ?", (number, order_id))
+    return number
+
+
+def claim_order(order_id: str, staff_name: str) -> bool:
+    """Returns False if someone already claimed it — prevents two baristas
+    both starting the same drink in a busy group chat."""
+    with get_db() as conn:
+        current = conn.execute("SELECT prep_status FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        if not current or current[0] != "new":
+            return False
+        conn.execute(
+            "UPDATE orders SET prep_status = 'preparing', claimed_by_name = ? WHERE order_id = ?",
+            (staff_name, order_id),
+        )
+    return True
+
+
+def mark_order_prep_ready(order_id: str):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET prep_status = 'ready' WHERE order_id = ?", (order_id,))
 
 
 def get_recent_orders(user_id: int, limit: int = 5) -> list[dict]:
