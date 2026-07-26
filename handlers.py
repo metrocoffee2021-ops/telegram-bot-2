@@ -86,6 +86,11 @@ def lang_of(user_id: int) -> str:
     return db.get_user_language(user_id)
 
 
+def add_nav_row(kb: InlineKeyboardBuilder, lang: str, back_callback: str):
+    kb.button(text=t(lang, "back_button"), callback_data=back_callback)
+    kb.button(text=t(lang, "menu_button"), callback_data="menu")
+
+
 def main_menu_keyboard(lang: str):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
@@ -155,7 +160,8 @@ async def show_items(callback: CallbackQuery):
             kb.button(text=f"{name} — {price_range_text(item)}", callback_data=f"item:{item['id']}")
         else:
             kb.button(text=f"❌ {name} — {t(lang, 'out_of_stock')}", callback_data="outofstock")
-    kb.adjust(1)
+    kb.button(text=t(lang, "back_button"), callback_data="menu")
+    kb.adjust(*([1] * len(items)), 1)
     header = category["name"].get(lang, category["name"]["en"]) if category else ""
     await callback.message.answer(header, reply_markup=kb.as_markup())
     await callback.answer()
@@ -181,7 +187,8 @@ async def choose_temp_or_size(callback: CallbackQuery):
         kb = InlineKeyboardBuilder()
         for temp in temps:
             kb.button(text=t(lang, f"temp_{temp}"), callback_data=f"temp:{item_id}:{temp}")
-        kb.adjust(2)
+        add_nav_row(kb, lang, back_callback=f"cat:{item['category_id']}")
+        kb.adjust(2, 2)
         await callback.message.answer(t(lang, "choose_temp"), reply_markup=kb.as_markup())
     else:
         await ask_size_or_add(callback, item_id, temps[0])
@@ -205,7 +212,8 @@ async def ask_size_or_add(callback: CallbackQuery, item_id: int, temp: str):
         for size in sizes:
             price = price_for(item, temp, size)
             kb.button(text=f"{size} — {fmt_price(price)} so'm", callback_data=f"size:{item_id}:{temp}:{size or '-'}")
-        kb.adjust(2)
+        add_nav_row(kb, lang, back_callback=f"item:{item_id}")
+        kb.adjust(2, 2)
         await callback.message.answer(t(lang, "choose_size"), reply_markup=kb.as_markup())
     else:
         await maybe_ask_topping(callback, item_id, temp, sizes[0])
@@ -229,7 +237,8 @@ async def maybe_ask_topping(callback: CallbackQuery, item_id: int, temp: str, si
             callback_data=f"topping:{item_id}:{temp}:{size_token}:yes",
         )
         kb.button(text=t(lang, "skip_topping"), callback_data=f"topping:{item_id}:{temp}:{size_token}:no")
-        kb.adjust(1)
+        add_nav_row(kb, lang, back_callback=f"temp:{item_id}:{temp}")
+        kb.adjust(1, 1, 2)
         await callback.message.answer(t(lang, "add_topping", price=fmt_price(EXTRA_TOPPING_PRICE)), reply_markup=kb.as_markup())
     else:
         await add_to_cart(callback, item_id, temp, size, topping=False)
@@ -419,7 +428,8 @@ async def notes_received(message: Message, state: FSMContext):
     kb.button(text="Click", callback_data="paymethod:click")
     kb.button(text="Payme", callback_data="paymethod:payme")
     kb.button(text=t(lang, "cash_payment_button"), callback_data="paymethod:cash")
-    kb.adjust(2, 1)
+    add_nav_row(kb, lang, back_callback="cart")
+    kb.adjust(2, 1, 2)
     await message.answer(t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
     await state.set_state(OrderFlow.choosing_payment_method)
 
