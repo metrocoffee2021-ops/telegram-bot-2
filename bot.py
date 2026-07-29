@@ -23,6 +23,7 @@ load_dotenv()  # reads the .env file next to this one
 logging.basicConfig(level=logging.INFO)
 
 DAILY_SUMMARY_HOUR_UTC = 17  # ~22:00 Tashkent time (UTC+5) — edit this if the shop's hours change
+BIRTHDAY_CHECK_HOUR_UTC = 4  # ~09:00 Tashkent time — sends birthday rewards early in the day
 
 
 async def daily_summary_loop(bot: Bot, owner_id: int):
@@ -48,6 +49,29 @@ async def daily_summary_loop(bot: Bot, owner_id: int):
         await asyncio.sleep(300)  # check every 5 minutes
 
 
+async def birthday_loop(bot: Bot):
+    """Checks once a day for customers whose birthday is today and grants
+    them a free coffee automatically."""
+    while True:
+        now = datetime.now(timezone.utc)
+        today_key = now.strftime("%Y-%m-%d")
+        month_day = now.strftime("%m-%d")
+        already_sent = db.get_setting("birthday_check_date")
+        if now.hour == BIRTHDAY_CHECK_HOUR_UTC and already_sent != today_key:
+            try:
+                for user_id in db.get_birthdays_today(month_day):
+                    db.grant_free_coffee(user_id)
+                    try:
+                        lang = db.get_user_language(user_id)
+                        await bot.send_message(user_id, t(lang, "birthday_gift_notice"))
+                    except Exception:
+                        pass  # customer may have blocked the bot
+            except Exception:
+                pass  # don't let a failed birthday check crash the whole bot
+            db.set_setting("birthday_check_date", today_key)
+        await asyncio.sleep(300)
+
+
 async def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -64,6 +88,7 @@ async def main():
 
     owner_id = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
     asyncio.create_task(daily_summary_loop(bot, owner_id))
+    asyncio.create_task(birthday_loop(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)

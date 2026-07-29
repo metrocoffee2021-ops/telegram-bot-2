@@ -49,6 +49,7 @@ def init_menu_tables():
             FOREIGN KEY (item_id) REFERENCES items(id)
         )""")
         db._add_column_if_missing(conn, "items", "in_stock", "INTEGER DEFAULT 1")
+        db._add_column_if_missing(conn, "items", "description", "TEXT")
 
 
 def seed_if_empty():
@@ -106,7 +107,7 @@ def get_category(category_id: int) -> dict | None:
 def list_items(category_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, name_uz, name_ru, name_en, has_topping_option, in_stock FROM items WHERE category_id = ? ORDER BY id",
+            "SELECT id, name_uz, name_ru, name_en, has_topping_option, in_stock, description FROM items WHERE category_id = ? ORDER BY id",
             (category_id,),
         ).fetchall()
         items = []
@@ -119,6 +120,7 @@ def list_items(category_id: int) -> list[dict]:
                 "name": _row_to_names(r[1:4]),
                 "has_topping_option": bool(r[4]),
                 "in_stock": bool(r[5]) if r[5] is not None else True,
+                "description": r[6],
                 "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
             })
     return items
@@ -127,7 +129,7 @@ def list_items(category_id: int) -> list[dict]:
 def get_item(item_id: int) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, category_id, name_uz, name_ru, name_en, has_topping_option, in_stock FROM items WHERE id = ?",
+            "SELECT id, category_id, name_uz, name_ru, name_en, has_topping_option, in_stock, description FROM items WHERE id = ?",
             (item_id,),
         ).fetchone()
         if not row:
@@ -141,6 +143,7 @@ def get_item(item_id: int) -> dict | None:
         "name": _row_to_names(row[2:5]),
         "has_topping_option": bool(row[5]),
         "in_stock": bool(row[6]) if row[6] is not None else True,
+        "description": row[7],
         "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
     }
 
@@ -148,6 +151,11 @@ def get_item(item_id: int) -> dict | None:
 def toggle_item_stock(item_id: int):
     with get_db() as conn:
         conn.execute("UPDATE items SET in_stock = 1 - COALESCE(in_stock, 1) WHERE id = ?", (item_id,))
+
+
+def set_item_description(item_id: int, description: str | None):
+    with get_db() as conn:
+        conn.execute("UPDATE items SET description = ? WHERE id = ?", (description, item_id))
 
 
 # ---------- writing (used by /admin) ----------

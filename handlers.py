@@ -41,6 +41,7 @@ class OrderFlow(StatesGroup):
     awaiting_contact = State()
     awaiting_location = State()
     awaiting_notes = State()
+    choosing_pickup_time = State()  # button-only step; no message handler here on purpose
     choosing_payment_method = State()  # button-only step; no message handler here on purpose
 
 
@@ -123,6 +124,15 @@ def main_menu_keyboard(lang: str):
 @router.message(CommandStart())
 async def start(message: Message):
     db.save_username(message.from_user.id, message.from_user.username)
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("ref_"):
+        try:
+            referrer_id = int(parts[1].removeprefix("ref_"))
+            db.record_referral(message.from_user.id, referrer_id)
+        except ValueError:
+            pass
+
     kb = InlineKeyboardBuilder()
     kb.button(text="O'zbek", callback_data="lang:uz")
     kb.button(text="Русский", callback_data="lang:ru")
@@ -212,7 +222,11 @@ async def choose_temp_or_size(callback: CallbackQuery):
         await respond(callback, t(lang, "choose_temp"), reply_markup=kb.as_markup())
     else:
         await ask_size_or_add(callback, item_id, temps[0])
-    await callback.answer()
+
+    if item.get("description"):
+        await callback.answer(item["description"], show_alert=True)
+    else:
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("temp:"))
@@ -280,7 +294,12 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
     name = item["name"].get(lang, item["name"]["en"])
 
     cart = CART.setdefault(callback.from_user.id, [])
-    cart.append({"name": name, "price": price, "temp": temp, "size": size, "topping": topping})
+    for entry in cart:
+        if entry["name"] == name and entry["temp"] == temp and entry["size"] == size and entry["topping"] == topping:
+            entry["qty"] += 1
+            break
+    else:
+        cart.append({"name": name, "price": price, "temp": temp, "size": size, "topping": topping, "qty": 1})
 
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
@@ -295,7 +314,7 @@ CART: dict[int, list[dict]] = {}
 
 
 def cart_total(user_id: int) -> int:
-    return sum(entry["price"] for entry in CART.get(user_id, []))
+    return sum(entry["price"] * entry["qty"] for entry in CART.get(user_id, []))
 
 
 def cart_lines(cart: list[dict]) -> list[str]:
@@ -306,7 +325,8 @@ def cart_lines(cart: list[dict]) -> list[str]:
             parts.append(entry["size"])
         if entry["topping"]:
             parts.append("+ boba")
-        lines.append("• " + " ".join(parts))
+        qty_suffix = f" x{entry['qty']}" if entry["qty"] > 1 else ""
+        lines.append("• " + " ".join(parts) + qty_suffix)
     return lines
 
 
@@ -320,6 +340,11 @@ async def cart_command(message: Message):
 @router.callback_query(F.data == "cart")
 async def cart_callback(callback: CallbackQuery):
     await show_cart_editable(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -339,21 +364,35 @@ async def show_cart_editable(target):
     kb = InlineKeyboardBuilder()
     for i, entry in enumerate(cart):
         label = entry["name"] + (f" {entry['size']}" if entry["size"] else "")
-        kb.button(text=f"🗑 {label}", callback_data=f"cartdel:{i}")
+        kb.button(text="➖", callback_data=f"cartdec:{i}")
+        kb.button(text=f"{label} x{entry['qty']}", callback_data="noop")
+        kb.button(text="➕", callback_data=f"cartinc:{i}")
     kb.button(text=t(lang, "checkout_button"), callback_data="checkout")
     kb.button(text=t(lang, "clear_cart_button"), callback_data="clearcart")
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
-    kb.adjust(*([1] * len(cart)), 1, 1, 1)
+    kb.adjust(*([3] * len(cart)), 1, 1, 1)
 
     await respond(target, text, reply_markup=kb.as_markup())
 
 
-@router.callback_query(F.data.startswith("cartdel:"))
-async def cart_delete_item(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("cartinc:"))
+async def cart_increment(callback: CallbackQuery):
     index = int(callback.data.split(":")[1])
     cart = CART.get(callback.from_user.id, [])
     if 0 <= index < len(cart):
-        cart.pop(index)
+        cart[index]["qty"] += 1
+    await show_cart_editable(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("cartdec:"))
+async def cart_decrement(callback: CallbackQuery):
+    index = int(callback.data.split(":")[1])
+    cart = CART.get(callback.from_user.id, [])
+    if 0 <= index < len(cart):
+        cart[index]["qty"] -= 1
+        if cart[index]["qty"] <= 0:
+            cart.pop(index)
     await show_cart_editable(callback)
     await callback.answer()
 
@@ -408,14 +447,29 @@ async def show_cart(callback: CallbackQuery, offer_payment: bool = False, state:
 async def contact_received(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
     await state.update_data(phone=message.contact.phone_number)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "fulfillment_pickup_button"), callback_data="fulfillment:pickup")
+    kb.button(text=t(lang, "fulfillment_delivery_button"), callback_data="fulfillment:delivery")
+    kb.adjust(2)
+    await message.answer(t(lang, "choose_fulfillment"), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("fulfillment:"))
+async def fulfillment_chosen(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    fulfillment = callback.data.split(":", 1)[1]
+    await state.update_data(fulfillment=fulfillment)
     await state.set_state(OrderFlow.awaiting_location)
 
+    prompt_key = "share_location_delivery_prompt" if fulfillment == "delivery" else "share_location_prompt"
     location_kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
+    await callback.message.answer(t(lang, prompt_key), reply_markup=location_kb)
+    await callback.answer()
 
 
 @router.message(OrderFlow.awaiting_contact)
@@ -432,13 +486,21 @@ async def contact_not_shared(message: Message):
 @router.message(OrderFlow.awaiting_location, F.location)
 async def location_received(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
-    branch = branches.nearest_branch(message.location.latitude, message.location.longitude)
-    await state.update_data(branch_name=branch["name"])
+    data = await state.get_data()
+    lat, lng = message.location.latitude, message.location.longitude
 
-    await message.answer(
-        t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if data.get("fulfillment") == "delivery":
+        maps_link = f"https://maps.google.com/?q={lat},{lng}"
+        await state.update_data(delivery_address=maps_link)
+        await message.answer(t(lang, "delivery_address_saved"), reply_markup=ReplyKeyboardRemove())
+    else:
+        branch = branches.nearest_branch(lat, lng)
+        await state.update_data(branch_name=branch["name"])
+        await message.answer(
+            t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
     await message.answer(t(lang, "ask_notes"))
     await state.set_state(OrderFlow.awaiting_notes)
 
@@ -451,13 +513,35 @@ async def notes_received(message: Message, state: FSMContext):
         await state.update_data(notes=text)
 
     kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "pickup_asap_button"), callback_data="pickuptime:ASAP")
+    kb.button(text=t(lang, "pickup_15_button"), callback_data="pickuptime:+15min")
+    kb.button(text=t(lang, "pickup_30_button"), callback_data="pickuptime:+30min")
+    kb.button(text=t(lang, "pickup_60_button"), callback_data="pickuptime:+1h")
+    kb.adjust(1, 3)
+    await message.answer(t(lang, "choose_pickup_time"), reply_markup=kb.as_markup())
+    await state.set_state(OrderFlow.choosing_pickup_time)
+
+
+@router.callback_query(F.data.startswith("pickuptime:"))
+async def pickup_time_chosen(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    pickup_time = callback.data.split(":", 1)[1]
+    await state.update_data(pickup_time=pickup_time)
+
+    kb = InlineKeyboardBuilder()
     kb.button(text="Click", callback_data="paymethod:click")
     kb.button(text="Payme", callback_data="paymethod:payme")
     kb.button(text=t(lang, "cash_payment_button"), callback_data="paymethod:cash")
-    add_nav_row(kb, lang, back_callback="cart")
-    kb.adjust(2, 1, 2)
-    await message.answer(t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
+    if db.get_bundle_credits(callback.from_user.id) > 0:
+        kb.button(text=t(lang, "bundle_pay_button", credits=db.get_bundle_credits(callback.from_user.id)), callback_data="paymethod:bundle")
+        add_nav_row(kb, lang, back_callback="cart")
+        kb.adjust(2, 1, 1, 2)
+    else:
+        add_nav_row(kb, lang, back_callback="cart")
+        kb.adjust(2, 1, 2)
+    await respond(callback, t(lang, "choose_payment_method"), reply_markup=kb.as_markup())
     await state.set_state(OrderFlow.choosing_payment_method)
+    await callback.answer()
 
 
 @router.message(OrderFlow.awaiting_location)
@@ -491,12 +575,17 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     db.create_order(
         order_id, callback.from_user.id, total, method,
         phone=data.get("phone"), branch_name=data.get("branch_name"), items_summary=items_summary,
-        items_json=json.dumps(cart_snapshot), notes=data.get("notes"),
+        items_json=json.dumps(cart_snapshot), notes=data.get("notes"), pickup_time=data.get("pickup_time"),
+        delivery_address=data.get("delivery_address"),
     )
     await state.clear()
 
     if method == "cash":
         await handle_cash_checkout(callback, order_id, lang)
+        return
+
+    if method == "bundle":
+        await handle_bundle_checkout(callback, order_id, cart_snapshot, lang)
         return
 
     provider_token = PROVIDER_TOKENS.get(method, "")
@@ -552,6 +641,47 @@ async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str
     await callback.answer()
 
 
+async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_snapshot: list, lang: str):
+    """Bundle credits were already paid for up front when the bundle was
+    bought, so — unlike cash — this confirms the order immediately, same as
+    a successful Click/Payme payment."""
+    qty_needed = sum(entry["qty"] for entry in cart_snapshot)
+    if not db.use_bundle_credits(callback.from_user.id, qty_needed):
+        await callback.answer(t(lang, "bundle_not_enough_credits"), show_alert=True)
+        return
+
+    db.mark_order_paid(order_id)
+    ticket_number = db.assign_order_number(order_id, db.now_utc().strftime("%Y-%m-%d"))
+    result = db.add_stamp(callback.from_user.id)
+    await apply_referral_bonus_if_applicable(callback.bot, callback.from_user.id)
+    CART[callback.from_user.id] = []
+
+    reply = t(lang, "payment_success", number=ticket_number)
+    order = db.get_order(order_id)
+    if order["branch_name"]:
+        reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
+    if result["earned_free_item"]:
+        reply += "\n" + t(lang, "free_coffee_ready")
+    remaining = db.get_bundle_credits(callback.from_user.id)
+    reply += "\n" + t(lang, "bundle_credits_remaining", credits=remaining)
+    await callback.message.answer(reply, reply_markup=main_menu_keyboard(lang))
+
+    notify_chat_id = STAFF_GROUP_ID or OWNER_ID
+    if notify_chat_id:
+        customer_label = order_customer_label(order)
+        staff_kb = InlineKeyboardBuilder()
+        staff_kb.button(text="✅ Confirm order", callback_data=f"claim:{order_id}")
+        try:
+            await callback.bot.send_message(
+                notify_chat_id, build_staff_order_text(order, ticket_number, customer_label),
+                reply_markup=staff_kb.as_markup(),
+            )
+        except Exception as e:
+            print(f"[bundle-checkout] FAILED to notify chat_id={notify_chat_id}: {e}")
+
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("cashconfirm:"))
 async def cash_checkout_confirm(callback: CallbackQuery):
     if not is_staff(callback):
@@ -567,6 +697,7 @@ async def cash_checkout_confirm(callback: CallbackQuery):
     today_str = db.now_utc().strftime("%Y-%m-%d")
     ticket_number = db.assign_order_number(order_id, today_str)
     result = db.add_stamp(order["user_id"])
+    await apply_referral_bonus_if_applicable(callback.bot, order["user_id"])
     order = db.get_order(order_id)
 
     staff_name = callback.from_user.full_name
@@ -596,12 +727,54 @@ async def cash_checkout_confirm(callback: CallbackQuery):
 
 
 
+@router.message(Command("buybundle"))
+async def buy_bundle(message: Message):
+    lang = lang_of(message.from_user.id)
+    price = db.get_setting("bundle_price")
+    credits = db.get_setting("bundle_credits_amount")
+    if not price or not credits:
+        await message.answer(t(lang, "bundle_not_configured"))
+        return
+    price, credits = int(price), int(credits)
+
+    provider_token = PROVIDER_TOKENS.get("click") or PROVIDER_TOKENS.get("payme")
+    if not provider_token:
+        await message.answer(t(lang, "payment_error"))
+        return
+
+    payload = f"bundle_{message.from_user.id}_{int(time.time())}"
+    await message.bot.send_invoice(
+        chat_id=message.from_user.id,
+        title=t(lang, "bundle_invoice_title"),
+        description=t(lang, "bundle_invoice_description", credits=credits),
+        payload=payload,
+        provider_token=provider_token,
+        currency="UZS",
+        prices=[LabeledPrice(label=t(lang, "total"), amount=price * 100)],
+    )
+
+
+async def handle_bundle_purchase_payment(message: Message):
+    lang = lang_of(message.from_user.id)
+    credits = int(db.get_setting("bundle_credits_amount", "0"))
+    db.add_bundle_credits(message.from_user.id, credits)
+    total_now = db.get_bundle_credits(message.from_user.id)
+    await message.answer(
+        t(lang, "bundle_purchased", credits=credits, total=total_now),
+        reply_markup=main_menu_keyboard(lang),
+    )
+
+
 @router.pre_checkout_query()
 async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
     # Telegram requires an answer within 10 seconds or the payment fails on
-    # the customer's side. The order was already created when the invoice
-    # was sent, so there's nothing further to validate here.
-    order = db.get_order(pre_checkout_query.invoice_payload)
+    # the customer's side. The order (or bundle purchase) was already created
+    # when the invoice was sent, so there's nothing further to validate here.
+    payload = pre_checkout_query.invoice_payload
+    if payload.startswith("bundle_"):
+        await pre_checkout_query.answer(ok=True)
+        return
+    order = db.get_order(payload)
     if order and order["status"] == "pending":
         await pre_checkout_query.answer(ok=True)
     else:
@@ -615,11 +788,16 @@ async def handle_successful_payment(message: Message):
     payment = message.successful_payment
     order_id = payment.invoice_payload
 
+    if order_id.startswith("bundle_"):
+        await handle_bundle_purchase_payment(message)
+        return
+
     db.set_order_gateway_ref(order_id, payment.telegram_payment_charge_id)
     db.mark_order_paid(order_id)
     today_str = db.now_utc().strftime("%Y-%m-%d")
     ticket_number = db.assign_order_number(order_id, today_str)
     result = db.add_stamp(message.from_user.id)
+    await apply_referral_bonus_if_applicable(message.bot, message.from_user.id)
     CART[message.from_user.id] = []
 
     order = db.get_order(order_id)
@@ -650,6 +828,28 @@ def order_customer_label(order: dict) -> str:
     return f"@{username}" if username else f"ID {order['user_id']}"
 
 
+async def apply_referral_bonus_if_applicable(bot, customer_id: int):
+    """Call this once per customer right after their order is confirmed paid —
+    on a NEW referred customer's first completed order, both people get a
+    bonus stamp. Safe to call every time; it's a no-op once already rewarded."""
+    referrer_id = db.get_unrewarded_referral(customer_id)
+    if not referrer_id:
+        return
+    db.mark_referral_rewarded(customer_id)
+    db.add_stamp(referrer_id)
+    db.add_stamp(customer_id)
+    try:
+        referrer_lang = lang_of(referrer_id)
+        await bot.send_message(referrer_id, t(referrer_lang, "referral_bonus_notice"))
+    except Exception:
+        pass
+    try:
+        customer_lang = lang_of(customer_id)
+        await bot.send_message(customer_id, t(customer_lang, "referral_bonus_notice"))
+    except Exception:
+        pass
+
+
 def build_staff_order_text(order: dict, ticket_number: int, customer_label: str, status_line: str = None) -> str:
     divider = "──────────────"
     items = order["items_summary"] or "—"
@@ -663,8 +863,12 @@ def build_staff_order_text(order: dict, ticket_number: int, customer_label: str,
     ]
     if order["phone"]:
         lines.append(f"📞 {order['phone']}")
-    if order["branch_name"]:
+    if order.get("delivery_address"):
+        lines.append(f"🚚 {order['delivery_address']}")
+    elif order["branch_name"]:
         lines.append(f"📍 {order['branch_name']}")
+    if order.get("pickup_time"):
+        lines.append(f"🕐 {order['pickup_time']}")
     if order["notes"]:
         lines.append(f"📝 {order['notes']}")
     if status_line:
@@ -812,7 +1016,12 @@ async def mark_order_ready(callback: CallbackQuery):
     db.mark_order_prep_ready(order_id)
     customer_lang = lang_of(order["user_id"])
     try:
+        rating_kb = InlineKeyboardBuilder()
+        for stars in range(1, 6):
+            rating_kb.button(text="⭐" * stars, callback_data=f"rate:{order_id}:{stars}")
+        rating_kb.adjust(5)
         await callback.bot.send_message(order["user_id"], t(customer_lang, "order_ready_notice"))
+        await callback.bot.send_message(order["user_id"], t(customer_lang, "rate_order_prompt"), reply_markup=rating_kb.as_markup())
     except Exception:
         pass  # customer may have blocked the bot
 
@@ -824,9 +1033,51 @@ async def mark_order_ready(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("rate:"))
+async def rate_order(callback: CallbackQuery):
+    lang = lang_of(callback.from_user.id)
+    _, order_id, stars = callback.data.split(":")
+    order = db.get_order(order_id)
+    if not order or order["user_id"] != callback.from_user.id:
+        await callback.answer()
+        return
+    db.save_order_rating(order_id, int(stars))
+    await callback.message.edit_text(t(lang, "rating_thanks", stars="⭐" * int(stars)))
+    await callback.answer()
+
+
 
 
 # ---------- loyalty ----------
+
+@router.message(Command("birthday"))
+async def set_birthday(message: Message):
+    lang = lang_of(message.from_user.id)
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(t(lang, "birthday_usage"))
+        return
+    raw = parts[1].strip().replace(".", "-").replace("/", "-")
+    segments = raw.split("-")
+    if len(segments) != 2:
+        await message.answer(t(lang, "birthday_invalid"))
+        return
+    try:
+        # accept either DD-MM or MM-DD by checking which segment can be a valid month
+        a, b = int(segments[0]), int(segments[1])
+        if 1 <= a <= 12 and not (1 <= b <= 12 and b <= 12 < a):
+            month, day = a, b
+        else:
+            month, day = b, a
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            raise ValueError
+        month_day = f"{month:02d}-{day:02d}"
+    except ValueError:
+        await message.answer(t(lang, "birthday_invalid"))
+        return
+    db.save_birthday(message.from_user.id, month_day)
+    await message.answer(t(lang, "birthday_saved"))
+
 
 @router.message(Command("myorders"))
 async def my_orders_command(message: Message):
@@ -860,6 +1111,8 @@ async def reorder(callback: CallbackQuery):
         return
 
     items = json.loads(order["items_json"])
+    for entry in items:
+        entry.setdefault("qty", 1)
     cart = CART.setdefault(callback.from_user.id, [])
     cart.extend(items)
     await callback.answer(t(lang, "items_added_to_cart"), show_alert=False)

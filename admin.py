@@ -395,7 +395,8 @@ async def show_item(user_id: int, item_id: int, send):
     header = (
         f"{t(lang, 'admin_item_header')} {name}\n\n"
         f"{t(lang, 'admin_topping_label')} {topping_state}\n"
-        f"{t(lang, 'admin_stock_label')} {stock_state}"
+        f"{t(lang, 'admin_stock_label')} {stock_state}\n"
+        f"{t(lang, 'admin_description_label')} {item['description'] or t(lang, 'admin_description_none')}"
     )
 
     kb = InlineKeyboardBuilder()
@@ -403,8 +404,9 @@ async def show_item(user_id: int, item_id: int, send):
         label = f"✏️ {variant_label(v['temp'], v['size'])} — {fmt_price(v['price'])} so'm"
         kb.button(text=label, callback_data=f"admeditprice:{v['id']}")
     kb.button(text=t(lang, "admin_rename_button"), callback_data=f"admrenameitem:{item_id}")
+    kb.button(text=t(lang, "admin_edit_description_button"), callback_data=f"admeditdesc:{item_id}")
     kb.button(text=t(lang, "admin_add_option_button"), callback_data=f"admaddoption:{item_id}")
-    trailing_rows = 6
+    trailing_rows = 7
     if item["variants"]:
         kb.button(text=t(lang, "admin_remove_option_button"), callback_data=f"admremoveopt:{item_id}")
         trailing_rows += 1
@@ -415,6 +417,37 @@ async def show_item(user_id: int, item_id: int, send):
     kb.adjust(*([1] * len(item["variants"])), *([1] * trailing_rows))
 
     await send(header, reply_markup=kb.as_markup())
+
+
+class DescFlow(StatesGroup):
+    awaiting_description = State()
+
+
+@router.callback_query(F.data.startswith("admeditdesc:"))
+async def edit_description_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[1])
+    lang = lang_of(callback.from_user.id)
+    await state.set_data({"item_id": item_id})
+    await state.set_state(DescFlow.awaiting_description)
+    await callback.message.answer(t(lang, "admin_send_description"))
+    await callback.answer()
+
+
+@router.message(DescFlow.awaiting_description)
+async def edit_description_received(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if not message.text:
+        return
+    lang = lang_of(message.from_user.id)
+    data = await state.get_data()
+    text = message.text.strip()
+    menu_store.set_item_description(data["item_id"], None if text.lower() == "skip" else text)
+    await state.clear()
+    await message.answer(t(lang, "admin_description_updated"))
+    await show_item(message.from_user.id, data["item_id"], message.answer)
 
 
 @router.callback_query(F.data.startswith("admtogglestock:"))
@@ -596,3 +629,59 @@ async def sales_report(message: Message):
 
     count, revenue, item_counts = _aggregate(orders)
     await message.answer(_format_report(lang, label, count, revenue, item_counts))
+
+
+# ---------- bundle configuration ----------
+
+@router.message(Command("setbundle"))
+async def set_bundle(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    lang = lang_of(message.from_user.id)
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer(t(lang, "admin_setbundle_usage"))
+        return
+    try:
+        credits = int(parts[1])
+        price = int(parts[2].replace(" ", "").replace(",", ""))
+        if credits <= 0 or price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(t(lang, "admin_setbundle_usage"))
+        return
+    db.set_setting("bundle_credits_amount", str(credits))
+    db.set_setting("bundle_price", str(price))
+    from handlers import fmt_price
+    await message.answer(t(lang, "admin_bundle_set", credits=credits, price=fmt_price(price)))
+
+
+# ---------- win-back ----------
+
+@router.message(Command("winback"))
+async def winback(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    lang = lang_of(message.from_user.id)
+    parts = message.text.split(maxsplit=2)
+    days = 14
+    text = None
+    if len(parts) >= 2 and parts[1].isdigit():
+        days = int(parts[1])
+        text = parts[2] if len(parts) > 2 else None
+    elif len(parts) >= 2:
+        text = message.text.split(maxsplit=1)[1]
+
+    inactive = db.get_inactive_customers(days)
+    if not text:
+        await message.answer(t(lang, "admin_winback_count", count=len(inactive), days=days))
+        return
+
+    sent = 0
+    for user_id in inactive:
+        try:
+            await message.bot.send_message(user_id, text)
+            sent += 1
+        except Exception:
+            pass
+    await message.answer(t(lang, "admin_winback_sent", count=sent))

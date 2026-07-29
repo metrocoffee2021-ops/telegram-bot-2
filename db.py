@@ -75,6 +75,17 @@ def init_db():
         _add_column_if_missing(conn, "orders", "prep_status", "TEXT DEFAULT 'new'")
         _add_column_if_missing(conn, "orders", "claimed_by_name", "TEXT")
         _add_column_if_missing(conn, "users", "username", "TEXT")
+        _add_column_if_missing(conn, "users", "birthday", "TEXT")  # stored as MM-DD
+        _add_column_if_missing(conn, "users", "bundle_credits", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "orders", "rating", "INTEGER")
+        _add_column_if_missing(conn, "orders", "pickup_time", "TEXT")
+        _add_column_if_missing(conn, "orders", "delivery_address", "TEXT")
+        _add_column_if_missing(conn, "orders", "used_bundle_credit", "INTEGER DEFAULT 0")
+        conn.execute("""CREATE TABLE IF NOT EXISTS referrals (
+            referred_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER,
+            rewarded INTEGER DEFAULT 0
+        )""")
 
 
 # ---- language ----
@@ -125,6 +136,19 @@ def get_all_user_ids() -> list[int]:
 
 
 # ---- loyalty (stamp card) ----
+
+def grant_free_coffee(user_id: int):
+    """Directly grants a free item without needing 10 stamps — used for
+    birthday rewards. Doesn't touch their existing stamp progress."""
+    with get_db() as conn:
+        existing = conn.execute("SELECT user_id FROM loyalty WHERE user_id = ?", (user_id,)).fetchone()
+        if existing:
+            conn.execute("UPDATE loyalty SET free_coffee_pending = 1 WHERE user_id = ?", (user_id,))
+        else:
+            conn.execute(
+                "INSERT INTO loyalty (user_id, stamps, free_coffee_pending) VALUES (?, 0, 1)", (user_id,)
+            )
+
 
 def add_stamp(user_id: int) -> dict:
     """Call this once per confirmed payment — never before. Returns whether this purchase
@@ -192,12 +216,14 @@ def get_loyalty_status(user_id: int) -> dict | None:
 # ---- orders (used to match a payment confirmation back to the right order) ----
 
 def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None,
-                  branch_name: str = None, items_summary: str = None, items_json: str = None, notes: str = None):
+                  branch_name: str = None, items_summary: str = None, items_json: str = None, notes: str = None,
+                  pickup_time: str = None, delivery_address: str = None):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes, now_utc().isoformat()),
+            "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, "
+            "items_json, notes, pickup_time, delivery_address, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes,
+             pickup_time, delivery_address, now_utc().isoformat()),
         )
 
 
@@ -220,7 +246,8 @@ def get_order(order_id: str) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
             "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, "
-            "items_summary, items_json, notes, status_notified_ready, order_number, prep_status, claimed_by_name "
+            "items_summary, items_json, notes, status_notified_ready, order_number, prep_status, claimed_by_name, "
+            "pickup_time, delivery_address, rating "
             "FROM orders WHERE order_id = ?",
             (order_id,),
         ).fetchone()
@@ -232,6 +259,7 @@ def get_order(order_id: str) -> dict | None:
         "phone": row[6], "branch_name": row[7], "items_summary": row[8],
         "items_json": row[9], "notes": row[10], "status_notified_ready": bool(row[11]),
         "order_number": row[12], "prep_status": row[13], "claimed_by_name": row[14],
+        "pickup_time": row[15], "delivery_address": row[16], "rating": row[17],
     }
 
 
@@ -301,6 +329,100 @@ def get_orders_since(iso_datetime: str) -> list[dict]:
 
 
 # ---- settings (simple key/value store — e.g. whether ordering is paused) ----
+
+# ---- birthday club ----
+
+def save_birthday(user_id: int, month_day: str):
+    """month_day format: 'MM-DD' — never store the year, that's a date of birth."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, birthday) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET birthday = ?",
+            (user_id, month_day, month_day),
+        )
+
+
+def get_birthdays_today(month_day: str) -> list[int]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT user_id FROM users WHERE birthday = ?", (month_day,)).fetchall()
+    return [r[0] for r in rows]
+
+
+# ---- ratings ----
+
+def save_order_rating(order_id: str, rating: int):
+    with get_db() as conn:
+        conn.execute("UPDATE orders SET rating = ? WHERE order_id = ?", (rating, order_id))
+
+
+# ---- referrals ----
+
+def record_referral(referred_id: int, referrer_id: int):
+    """Only takes effect the first time — a user can't be re-referred later."""
+    if referred_id == referrer_id:
+        return
+    with get_db() as conn:
+        existing = conn.execute("SELECT 1 FROM referrals WHERE referred_id = ?", (referred_id,)).fetchone()
+        if existing:
+            return
+        conn.execute("INSERT INTO referrals (referred_id, referrer_id, rewarded) VALUES (?, ?, 0)", (referred_id, referrer_id))
+
+
+def get_unrewarded_referral(referred_id: int) -> int | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id = ? AND rewarded = 0", (referred_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def mark_referral_rewarded(referred_id: int):
+    with get_db() as conn:
+        conn.execute("UPDATE referrals SET rewarded = 1 WHERE referred_id = ?", (referred_id,))
+
+
+# ---- prepaid bundle credits ----
+
+def get_bundle_credits(user_id: int) -> int:
+    with get_db() as conn:
+        row = conn.execute("SELECT bundle_credits FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row and row[0] else 0
+
+
+def add_bundle_credits(user_id: int, amount: int):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, bundle_credits) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET bundle_credits = COALESCE(bundle_credits, 0) + ?",
+            (user_id, amount, amount),
+        )
+
+
+def use_bundle_credits(user_id: int, amount: int) -> bool:
+    """Returns False (and changes nothing) if the customer doesn't have enough credits."""
+    with get_db() as conn:
+        row = conn.execute("SELECT bundle_credits FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        current = row[0] if row and row[0] else 0
+        if current < amount:
+            return False
+        conn.execute("UPDATE users SET bundle_credits = bundle_credits - ? WHERE user_id = ?", (amount, user_id))
+    return True
+
+
+# ---- win-back (inactive customers) ----
+
+def get_inactive_customers(days: int) -> list[int]:
+    """Customers whose most recent PAID order is older than `days` ago (or who
+    have never ordered but did message the bot — excluded, since a win-back
+    message to someone who never ordered isn't a 'win back')."""
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT user_id FROM orders WHERE status = 'paid'
+               GROUP BY user_id HAVING MAX(created_at) < ?""",
+            (cutoff,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
 
 def get_setting(key: str, default: str = None) -> str:
     with get_db() as conn:
