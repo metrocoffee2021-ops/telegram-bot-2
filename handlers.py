@@ -312,6 +312,30 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 # mid-order, which is an acceptable tradeoff for a small shop (customer just re-adds items).
 CART: dict[int, list[dict]] = {}
 
+# Tracks bot messages sent during checkout (contact/fulfillment/location/notes/pickup-time
+# prompts) so they can all be deleted once the order completes — customers have a Back
+# button for navigating while it's in progress, so nothing is lost by cleaning up after.
+CHECKOUT_MESSAGES: dict[int, list[int]] = {}
+
+
+def track_checkout_message(user_id: int, message_id: int):
+    CHECKOUT_MESSAGES.setdefault(user_id, []).append(message_id)
+
+
+async def cleanup_checkout_messages(bot, user_id: int):
+    for message_id in CHECKOUT_MESSAGES.pop(user_id, []):
+        try:
+            await bot.delete_message(user_id, message_id)
+        except Exception:
+            pass  # message may already be gone, or too old to delete (Telegram's 48h limit) — harmless either way
+
+
+async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_you_text: str):
+    await cleanup_checkout_messages(bot, user_id)
+    await bot.send_message(user_id, thank_you_text, reply_markup=main_menu_keyboard(lang))
+
+
+
 
 def cart_total(user_id: int) -> int:
     return sum(entry["price"] * entry["qty"] for entry in CART.get(user_id, []))
@@ -412,6 +436,7 @@ async def checkout_callback(callback: CallbackQuery, state: FSMContext):
     if db.get_setting("ordering_paused") == "1":
         await callback.answer(t(lang, "ordering_paused_notice"), show_alert=True)
         return
+    CHECKOUT_MESSAGES[callback.from_user.id] = [callback.message.message_id]
     await show_cart(callback, offer_payment=True, state=state)
     await callback.answer()
 
@@ -438,7 +463,8 @@ async def show_cart(callback: CallbackQuery, offer_payment: bool = False, state:
         await respond(callback, text)
         # A ReplyKeyboardMarkup can't be attached to an edited message in Telegram —
         # this one new message is unavoidable, everything else in the flow is edited in place.
-        await callback.message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+        contact_msg = await callback.message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+        track_checkout_message(user_id, contact_msg.message_id)
     else:
         await respond(callback, text)
 
@@ -452,7 +478,8 @@ async def contact_received(message: Message, state: FSMContext):
     kb.button(text=t(lang, "fulfillment_pickup_button"), callback_data="fulfillment:pickup")
     kb.button(text=t(lang, "fulfillment_delivery_button"), callback_data="fulfillment:delivery")
     kb.adjust(2)
-    await message.answer(t(lang, "choose_fulfillment"), reply_markup=kb.as_markup())
+    sent = await message.answer(t(lang, "choose_fulfillment"), reply_markup=kb.as_markup())
+    track_checkout_message(message.from_user.id, sent.message_id)
 
 
 @router.callback_query(F.data.startswith("fulfillment:"))
@@ -468,7 +495,8 @@ async def fulfillment_chosen(callback: CallbackQuery, state: FSMContext):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await callback.message.answer(t(lang, prompt_key), reply_markup=location_kb)
+    sent = await callback.message.answer(t(lang, prompt_key), reply_markup=location_kb)
+    track_checkout_message(callback.from_user.id, sent.message_id)
     await callback.answer()
 
 
@@ -480,7 +508,8 @@ async def contact_not_shared(message: Message):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+    sent = await message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+    track_checkout_message(message.from_user.id, sent.message_id)
 
 
 @router.message(OrderFlow.awaiting_location, F.location)
@@ -492,16 +521,18 @@ async def location_received(message: Message, state: FSMContext):
     if data.get("fulfillment") == "delivery":
         maps_link = f"https://maps.google.com/?q={lat},{lng}"
         await state.update_data(delivery_address=maps_link)
-        await message.answer(t(lang, "delivery_address_saved"), reply_markup=ReplyKeyboardRemove())
+        sent1 = await message.answer(t(lang, "delivery_address_saved"), reply_markup=ReplyKeyboardRemove())
     else:
         branch = branches.nearest_branch(lat, lng)
         await state.update_data(branch_name=branch["name"])
-        await message.answer(
+        sent1 = await message.answer(
             t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
             reply_markup=ReplyKeyboardRemove(),
         )
+    track_checkout_message(message.from_user.id, sent1.message_id)
 
-    await message.answer(t(lang, "ask_notes"))
+    sent2 = await message.answer(t(lang, "ask_notes"))
+    track_checkout_message(message.from_user.id, sent2.message_id)
     await state.set_state(OrderFlow.awaiting_notes)
 
 
@@ -518,7 +549,8 @@ async def notes_received(message: Message, state: FSMContext):
     kb.button(text=t(lang, "pickup_30_button"), callback_data="pickuptime:+30min")
     kb.button(text=t(lang, "pickup_60_button"), callback_data="pickuptime:+1h")
     kb.adjust(1, 3)
-    await message.answer(t(lang, "choose_pickup_time"), reply_markup=kb.as_markup())
+    sent = await message.answer(t(lang, "choose_pickup_time"), reply_markup=kb.as_markup())
+    track_checkout_message(message.from_user.id, sent.message_id)
     await state.set_state(OrderFlow.choosing_pickup_time)
 
 
@@ -552,7 +584,8 @@ async def location_not_shared(message: Message):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
+    sent = await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
+    track_checkout_message(message.from_user.id, sent.message_id)
 
 
 @router.callback_query(F.data.startswith("paymethod:"))
@@ -637,6 +670,7 @@ async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str
         except Exception as e:
             print(f"[cash-checkout] FAILED to notify chat_id={notify_chat_id}: {e}")
 
+    await cleanup_checkout_messages(callback.bot, callback.from_user.id)
     await callback.message.answer(t(lang, "cash_order_placed_customer"))
     await callback.answer()
 
@@ -656,7 +690,7 @@ async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_sn
     await apply_referral_bonus_if_applicable(callback.bot, callback.from_user.id)
     CART[callback.from_user.id] = []
 
-    reply = t(lang, "payment_success", number=ticket_number)
+    reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
     order = db.get_order(order_id)
     if order["branch_name"]:
         reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
@@ -664,7 +698,7 @@ async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_sn
         reply += "\n" + t(lang, "free_coffee_ready")
     remaining = db.get_bundle_credits(callback.from_user.id)
     reply += "\n" + t(lang, "bundle_credits_remaining", credits=remaining)
-    await callback.message.answer(reply, reply_markup=main_menu_keyboard(lang))
+    await finish_order_and_return_to_menu(callback.bot, callback.from_user.id, lang, reply)
 
     notify_chat_id = STAFF_GROUP_ID or OWNER_ID
     if notify_chat_id:
@@ -711,14 +745,14 @@ async def cash_checkout_confirm(callback: CallbackQuery):
 
     customer_lang = lang_of(order["user_id"])
     try:
-        notice = t(customer_lang, "cash_order_confirmed_customer", number=ticket_number)
+        notice = t(customer_lang, "order_complete_thanks") + "\n" + t(customer_lang, "cash_order_confirmed_customer", number=ticket_number)
         if order["branch_name"]:
             notice += "\n" + t(customer_lang, "pickup_reminder", branch=order["branch_name"])
         if result["earned_free_item"]:
             notice += "\n" + t(customer_lang, "free_coffee_ready")
         elif result["card_expired"]:
             notice += "\n" + t(customer_lang, "card_expired_notice")
-        await callback.bot.send_message(order["user_id"], notice, reply_markup=main_menu_keyboard(customer_lang))
+        await finish_order_and_return_to_menu(callback.bot, order["user_id"], customer_lang, notice)
     except Exception:
         pass  # customer may have blocked the bot
 
@@ -801,14 +835,14 @@ async def handle_successful_payment(message: Message):
     CART[message.from_user.id] = []
 
     order = db.get_order(order_id)
-    reply = t(lang, "payment_success", number=ticket_number)
+    reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
     if order and order["branch_name"]:
         reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
     if result["card_expired"]:
         reply += "\n" + t(lang, "card_expired_notice")
     if result["earned_free_item"]:
         reply += "\n" + t(lang, "free_coffee_ready")
-    await message.answer(reply, reply_markup=main_menu_keyboard(lang))
+    await finish_order_and_return_to_menu(message.bot, message.from_user.id, lang, reply)
 
     # Staff notification — without this, nobody at the shop knows an order came in.
     notify_chat_id = STAFF_GROUP_ID or OWNER_ID
