@@ -334,6 +334,14 @@ async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_yo
     await cleanup_checkout_messages(bot, user_id)
     await bot.send_message(user_id, thank_you_text, reply_markup=main_menu_keyboard(lang))
 
+    categories = menu_store.list_categories()
+    if categories:
+        kb = InlineKeyboardBuilder()
+        for cat in categories:
+            kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
+        kb.adjust(2)
+        await bot.send_message(user_id, t(lang, "choose_category"), reply_markup=kb.as_markup())
+
 
 
 
@@ -531,7 +539,9 @@ async def location_received(message: Message, state: FSMContext):
         )
     track_checkout_message(message.from_user.id, sent1.message_id)
 
-    sent2 = await message.answer(t(lang, "ask_notes"))
+    skip_kb = InlineKeyboardBuilder()
+    skip_kb.button(text=t(lang, "skip_notes_button"), callback_data="skipnotes")
+    sent2 = await message.answer(t(lang, "ask_notes"), reply_markup=skip_kb.as_markup())
     track_checkout_message(message.from_user.id, sent2.message_id)
     await state.set_state(OrderFlow.awaiting_notes)
 
@@ -542,15 +552,25 @@ async def notes_received(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text and text.lower() not in {"skip", "o'tkazib yuborish", "пропустить", "-"}:
         await state.update_data(notes=text)
+    await prompt_pickup_time(message.bot, message.from_user.id, lang, state, send=message.answer)
 
+
+@router.callback_query(F.data == "skipnotes")
+async def skip_notes(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    await prompt_pickup_time(callback.bot, callback.from_user.id, lang, state, send=callback.message.answer)
+    await callback.answer()
+
+
+async def prompt_pickup_time(bot, user_id: int, lang: str, state: FSMContext, send):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "pickup_asap_button"), callback_data="pickuptime:ASAP")
     kb.button(text=t(lang, "pickup_15_button"), callback_data="pickuptime:+15min")
     kb.button(text=t(lang, "pickup_30_button"), callback_data="pickuptime:+30min")
     kb.button(text=t(lang, "pickup_60_button"), callback_data="pickuptime:+1h")
     kb.adjust(1, 3)
-    sent = await message.answer(t(lang, "choose_pickup_time"), reply_markup=kb.as_markup())
-    track_checkout_message(message.from_user.id, sent.message_id)
+    sent = await send(t(lang, "choose_pickup_time"), reply_markup=kb.as_markup())
+    track_checkout_message(user_id, sent.message_id)
     await state.set_state(OrderFlow.choosing_pickup_time)
 
 
