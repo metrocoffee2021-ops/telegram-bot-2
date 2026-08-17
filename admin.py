@@ -3,7 +3,6 @@
 # drinks and sections entirely from inside Telegram. No code editing, ever.
 # Only the Telegram account matching OWNER_TELEGRAM_ID (set in .env) can use this.
 
-import os
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -14,13 +13,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
 
+import config
 from texts import t
 import menu_store
 import db
 
 router = Router()
 
-OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
+OWNER_ID = config.OWNER_TELEGRAM_ID
 
 
 class AdminFlow(StatesGroup):

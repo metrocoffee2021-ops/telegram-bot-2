@@ -106,6 +106,7 @@ def init_db():
         _add_column_if_missing(conn, "orders", "subtotal", "INTEGER")
         _add_column_if_missing(conn, "orders", "discount_amount", "INTEGER DEFAULT 0")
         _add_column_if_missing(conn, "orders", "birthday_reward_id", "INTEGER")
+    ensure_management_tables()
 
 
 # ---- language ----
@@ -587,3 +588,50 @@ def set_setting(key: str, value: str):
             "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
             (key, value, value),
         )
+
+# ---- managed branches / promotions ----
+def ensure_management_tables():
+    with get_db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS branches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, address TEXT NOT NULL,
+            lat REAL NOT NULL, lng REAL NOT NULL, active INTEGER DEFAULT 1)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS promotions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, code TEXT UNIQUE NOT NULL,
+            kind TEXT NOT NULL, value INTEGER NOT NULL, active INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL)""")
+        if conn.execute("SELECT COUNT(*) FROM branches").fetchone()[0] == 0:
+            try:
+                import branches as legacy
+                for b in legacy.BRANCHES:
+                    conn.execute("INSERT INTO branches(name,address,lat,lng,active) VALUES(?,?,?,?,1)",(b['name'],b['address'],b['lat'],b['lng']))
+            except Exception: pass
+
+def list_branches():
+    ensure_management_tables()
+    with get_db() as conn:
+        rows=conn.execute("SELECT id,name,address,lat,lng,active FROM branches ORDER BY id").fetchall()
+    return [dict(id=r[0],name=r[1],address=r[2],lat=r[3],lng=r[4],active=bool(r[5])) for r in rows]
+def get_branch(i): return next((b for b in list_branches() if b['id']==i),None)
+def add_branch(name,address,lat,lng):
+    ensure_management_tables()
+    with get_db() as c: cur=c.execute("INSERT INTO branches(name,address,lat,lng,active) VALUES(?,?,?,?,1)",(name,address,lat,lng)); return cur.lastrowid
+def toggle_branch(i):
+    ensure_management_tables()
+    with get_db() as c: c.execute("UPDATE branches SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(i,))
+def delete_branch(i):
+    ensure_management_tables()
+    with get_db() as c: c.execute("DELETE FROM branches WHERE id=?",(i,))
+def list_promotions():
+    ensure_management_tables()
+    with get_db() as c: rows=c.execute("SELECT id,name,code,kind,value,active,created_at FROM promotions ORDER BY id DESC").fetchall()
+    return [dict(id=r[0],name=r[1],code=r[2],kind=r[3],value=r[4],active=bool(r[5]),created_at=r[6]) for r in rows]
+def get_promotion(i): return next((p for p in list_promotions() if p['id']==i),None)
+def add_promotion(name,code,kind,value):
+    ensure_management_tables()
+    with get_db() as c: cur=c.execute("INSERT INTO promotions(name,code,kind,value,active,created_at) VALUES(?,?,?,?,0,?)",(name,code,kind,value,now_utc().isoformat())); return cur.lastrowid
+def toggle_promotion(i):
+    ensure_management_tables()
+    with get_db() as c: c.execute("UPDATE promotions SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?",(i,))
+def delete_promotion(i):
+    ensure_management_tables()
+    with get_db() as c: c.execute("DELETE FROM promotions WHERE id=?",(i,))

@@ -5,7 +5,6 @@
 # The menu itself is NOT in this file — it's in the database, managed
 # through /admin (see admin.py). This file only reads it.
 
-import os
 import time
 import json
 import html
@@ -19,6 +18,7 @@ from aiogram.filters import CommandStart, Command
 from datetime import datetime, timedelta
 import asyncio
 
+import config
 from texts import t
 from menu_data import EXTRA_TOPPING_PRICE
 import menu_store
@@ -27,14 +27,14 @@ import branches
 
 router = Router()
 
-OWNER_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
-STAFF_GROUP_ID = int(os.environ.get("STAFF_GROUP_ID", "0"))
+OWNER_ID = config.OWNER_TELEGRAM_ID
+STAFF_GROUP_ID = config.STAFF_GROUP_ID
 
 # Telegram's native payment provider tokens, obtained via @BotFather > Payments.
 # Format looks like "333605228:LIVE:xxxx" — nothing like a merchant API key.
 PROVIDER_TOKENS = {
-    "click": os.environ.get("CLICK_PROVIDER_TOKEN", ""),
-    "payme": os.environ.get("PAYME_PROVIDER_TOKEN", ""),
+    "click": config.CLICK_PROVIDER_TOKEN,
+    "payme": config.PAYME_PROVIDER_TOKEN,
 }
 
 
@@ -44,6 +44,7 @@ class OrderFlow(StatesGroup):
     awaiting_notes = State()
     choosing_pickup_time = State()  # button-only step; no message handler here on purpose
     choosing_payment_method = State()  # button-only step; no message handler here on purpose
+    awaiting_promo_code = State()
 
 
 class OnboardingFlow(StatesGroup):
@@ -94,6 +95,22 @@ def price_range_text(item: dict) -> str:
 
 def lang_of(user_id: int) -> str:
     return db.get_user_language(user_id)
+
+
+def promo_label(lang, key):
+    labels={
+      "uz":{"enter":"🎟 Promo kodni kiriting:","invalid":"Promo kod topilmadi yoki faol emas.","applied":"🎟 Promo qo‘llandi: -{discount} so‘m","button":"🎟 Promo kod"},
+      "ru":{"enter":"🎟 Введите промокод:","invalid":"Промокод не найден или неактивен.","applied":"🎟 Промокод применён: -{discount} сум","button":"🎟 Промокод"},
+      "en":{"enter":"🎟 Enter promo code:","invalid":"Promo code not found or inactive.","applied":"🎟 Promo applied: -{discount} UZS","button":"🎟 Promo code"}}
+    return labels.get(lang,labels["en"])[key]
+
+def promotion_discount(user_id, code, subtotal):
+    if not code: return (0,None)
+    for p in db.list_promotions():
+        if p["active"] and p["code"].upper()==code.strip().upper():
+            if p["kind"]=="percent": return (min(subtotal, subtotal*p["value"]//100), p)
+            return (min(subtotal,p["value"]),p)
+    return (0,None)
 
 
 async def respond(target, text: str, reply_markup=None, parse_mode: str | None = None):
@@ -611,14 +628,18 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
     existing_state = await state.get_data() if state is not None else {}
     birthday_item_index = existing_state.get("birthday_item_index")
     subtotal = cart_total(user_id)
-    discount = birthday_discount_for_cart(user_id, birthday_item_index)
+    birthday_discount = birthday_discount_for_cart(user_id, birthday_item_index)
+    promo_discount, promo = promotion_discount(user_id, existing_state.get("promo_code"), subtotal)
+    discount = birthday_discount if birthday_discount else promo_discount
     total = subtotal - discount
     text = (
         f"<b>{esc(t(lang, 'your_order'))}</b>\n"
         + "\n".join(cart_lines_html(cart))
     )
-    if discount:
-        text += f"\n\n{esc(t(lang, 'birthday_discount_line', percent=db.BIRTHDAY_DISCOUNT_PERCENT))}: -{fmt_price(discount)} so'm"
+    if birthday_discount:
+        text += f"\n\n{esc(t(lang, 'birthday_discount_line', percent=db.BIRTHDAY_DISCOUNT_PERCENT))}: -{fmt_price(birthday_discount)} so'm"
+    elif promo_discount:
+        text += f"\n\n{esc(promo_label(lang, 'applied').format(discount=fmt_price(promo_discount)))}"
     text += f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
     send = target.message.answer if isinstance(target, CallbackQuery) else target.answer
 
@@ -888,6 +909,37 @@ async def birthday_item_selected(callback: CallbackQuery, state: FSMContext):
     await show_cart(callback, offer_payment=True, state=state)
 
 
+
+@router.message(Command("promo"))
+async def promo_command(message: Message, state: FSMContext):
+    lang=lang_of(message.from_user.id); parts=(message.text or "").split(maxsplit=1)
+    if len(parts)<2:
+        await message.answer(promo_label(lang,"enter")); await state.set_state(OrderFlow.awaiting_promo_code); return
+    code=parts[1].strip().upper(); subtotal=cart_total(message.from_user.id); discount,p=promotion_discount(message.from_user.id,code,subtotal)
+    if not p: await message.answer(promo_label(lang,"invalid")); return
+    await state.update_data(promo_code=code,promo_discount=discount); await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)))
+
+@router.callback_query(F.data == "promo_enter")
+async def promo_enter(callback: CallbackQuery, state: FSMContext):
+    lang=lang_of(callback.from_user.id)
+    await state.set_state(OrderFlow.awaiting_promo_code)
+    await callback.message.answer(promo_label(lang,"enter"))
+    await callback.answer()
+
+@router.message(OrderFlow.awaiting_promo_code)
+async def promo_received(message: Message, state: FSMContext):
+    lang=lang_of(message.from_user.id); code=(message.text or "").strip().upper(); subtotal=cart_total(message.from_user.id)
+    discount,p=promotion_discount(message.from_user.id,code,subtotal)
+    if not p:
+        await message.answer(promo_label(lang,"invalid")); return
+    await state.update_data(promo_code=code,promo_discount=discount)
+    await state.set_state(OrderFlow.choosing_payment_method)
+    await show_cart(message, offer_payment=False, state=state)
+    await prompt_pickup_time(message.bot,message.from_user.id,lang,state,send=message.answer) if False else None
+    # The customer returns to the normal checkout flow; the existing payment selector is shown below.
+    kb=InlineKeyboardBuilder(); kb.button(text="Click",callback_data="paymethod:click"); kb.button(text="Payme",callback_data="paymethod:payme"); kb.button(text=t(lang,"cash_payment_button"),callback_data="paymethod:cash"); kb.adjust(2,1)
+    await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)),reply_markup=kb.as_markup())
+
 @router.callback_query(F.data.startswith("paymethod:"))
 async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     method = callback.data.split(":")[1]
@@ -899,6 +951,8 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     birthday_reward_id = data.get("birthday_reward_id")
     subtotal = cart_total(callback.from_user.id)
     discount = birthday_discount_for_cart(callback.from_user.id, birthday_item_index) if birthday_reward_id else 0
+    if not discount and data.get("promo_code"):
+        discount,_promo = promotion_discount(callback.from_user.id, data.get("promo_code"), subtotal)
     total = subtotal - discount
     if birthday_reward_id:
         reward = db.get_active_birthday_reward(callback.from_user.id)

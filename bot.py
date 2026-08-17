@@ -10,15 +10,14 @@ from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
+import config
 
 import db
 import menu_store
 from handlers import router as customer_router, fmt_price
 from admin import router as admin_router, _aggregate, _format_report
 from texts import t
-
-load_dotenv()  # reads the .env file next to this one
+from manager import router as manager_router
 
 logging.basicConfig(level=logging.INFO)
 
@@ -73,7 +72,7 @@ async def birthday_loop(bot: Bot):
 
 
 async def main():
-    token = os.environ.get("BOT_TOKEN")
+    token = config.BOT_TOKEN
     if not token:
         raise RuntimeError("BOT_TOKEN is missing — open the .env file and paste your bot token there.")
 
@@ -83,10 +82,11 @@ async def main():
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(manager_router)
     dp.include_router(admin_router)
     dp.include_router(customer_router)
 
-    owner_id = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
+    owner_id = config.OWNER_TELEGRAM_ID
     asyncio.create_task(daily_summary_loop(bot, owner_id))
     asyncio.create_task(birthday_loop(bot))
 
