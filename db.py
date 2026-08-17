@@ -11,6 +11,8 @@ DB_PATH = "metropia.db"
 
 STAMPS_FOR_FREE_ITEM = 10   # buy 9, the 10th is free
 CARD_VALID_DAYS = 30        # matches the offline card: valid one month after the first stamp
+BIRTHDAY_DISCOUNT_PERCENT = 50
+BIRTHDAY_REWARD_VALID_DAYS = 7
 
 
 def now_utc() -> datetime:
@@ -90,6 +92,20 @@ def init_db():
             referrer_id INTEGER,
             rewarded INTEGER DEFAULT 0
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS birthday_rewards (
+            reward_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            birthday_year INTEGER NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            order_id TEXT,
+            status TEXT DEFAULT 'active',
+            UNIQUE(user_id, birthday_year)
+        )""")
+        _add_column_if_missing(conn, "orders", "subtotal", "INTEGER")
+        _add_column_if_missing(conn, "orders", "discount_amount", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "orders", "birthday_reward_id", "INTEGER")
 
 
 # ---- language ----
@@ -283,13 +299,17 @@ def get_loyalty_status(user_id: int) -> dict | None:
 
 def create_order(order_id: str, user_id: int, total: int, payment_method: str, phone: str = None,
                   branch_name: str = None, items_summary: str = None, items_json: str = None, notes: str = None,
-                  pickup_time: str = None, delivery_address: str = None):
+                  pickup_time: str = None, delivery_address: str = None, subtotal: int = None,
+                  discount_amount: int = 0, birthday_reward_id: int = None):
+    if subtotal is None:
+        subtotal = total + (discount_amount or 0)
     with get_db() as conn:
         conn.execute(
             "INSERT INTO orders (order_id, user_id, total, payment_method, phone, branch_name, items_summary, "
-            "items_json, notes, pickup_time, delivery_address, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "items_json, notes, pickup_time, delivery_address, created_at, subtotal, discount_amount, birthday_reward_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (order_id, user_id, total, payment_method, phone, branch_name, items_summary, items_json, notes,
-             pickup_time, delivery_address, now_utc().isoformat()),
+             pickup_time, delivery_address, now_utc().isoformat(), subtotal, discount_amount, birthday_reward_id),
         )
 
 
@@ -301,6 +321,17 @@ def set_order_gateway_ref(order_id: str, gateway_ref: str):
 def mark_order_paid(order_id: str):
     with get_db() as conn:
         conn.execute("UPDATE orders SET status = 'paid' WHERE order_id = ?", (order_id,))
+        reward = conn.execute(
+            "SELECT birthday_reward_id FROM orders WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        if reward and reward[0]:
+            cur = conn.execute(
+                "UPDATE birthday_rewards SET status='used', used_at=?, order_id=? "
+                "WHERE reward_id=? AND status='active' AND expires_at >= ?",
+                (now_utc().isoformat(), order_id, reward[0], now_utc().isoformat()),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("Birthday reward is no longer valid")
 
 
 def mark_order_ready_notified(order_id: str):
@@ -313,7 +344,7 @@ def get_order(order_id: str) -> dict | None:
         row = conn.execute(
             "SELECT order_id, user_id, total, status, payment_method, gateway_ref, phone, branch_name, "
             "items_summary, items_json, notes, status_notified_ready, order_number, prep_status, claimed_by_name, "
-            "pickup_time, delivery_address, rating "
+            "pickup_time, delivery_address, rating, subtotal, discount_amount, birthday_reward_id "
             "FROM orders WHERE order_id = ?",
             (order_id,),
         ).fetchone()
@@ -326,6 +357,7 @@ def get_order(order_id: str) -> dict | None:
         "items_json": row[9], "notes": row[10], "status_notified_ready": bool(row[11]),
         "order_number": row[12], "prep_status": row[13], "claimed_by_name": row[14],
         "pickup_time": row[15], "delivery_address": row[16], "rating": row[17],
+        "subtotal": row[18], "discount_amount": row[19] or 0, "birthday_reward_id": row[20],
     }
 
 
@@ -431,6 +463,39 @@ def get_birthdays_today(month_day: str) -> list[int]:
     with get_db() as conn:
         rows = conn.execute("SELECT user_id FROM users WHERE birthday = ?", (month_day,)).fetchall()
     return [r[0] for r in rows]
+
+
+def issue_birthday_reward(user_id: int, year: int | None = None) -> dict:
+    """Issue one 50% birthday reward for a calendar year. The reward is valid for 7 days."""
+    now = now_utc()
+    year = year or now.year
+    issued_at = now.isoformat()
+    expires_at = (now + timedelta(days=BIRTHDAY_REWARD_VALID_DAYS)).isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT reward_id, status, expires_at FROM birthday_rewards WHERE user_id=? AND birthday_year=?",
+            (user_id, year),
+        ).fetchone()
+        if row:
+            return {"reward_id": row[0], "status": row[1], "expires_at": row[2], "new": False}
+        cur = conn.execute(
+            "INSERT INTO birthday_rewards (user_id, birthday_year, issued_at, expires_at) VALUES (?, ?, ?, ?)",
+            (user_id, year, issued_at, expires_at),
+        )
+        return {"reward_id": cur.lastrowid, "status": "active", "expires_at": expires_at, "new": True}
+
+
+def get_active_birthday_reward(user_id: int) -> dict | None:
+    now = now_utc().isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT reward_id, birthday_year, issued_at, expires_at, status FROM birthday_rewards "
+            "WHERE user_id=? AND status='active' AND expires_at >= ? ORDER BY reward_id DESC LIMIT 1",
+            (user_id, now),
+        ).fetchone()
+    if not row:
+        return None
+    return {"reward_id": row[0], "birthday_year": row[1], "issued_at": row[2], "expires_at": row[3], "status": row[4]}
 
 
 # ---- ratings ----

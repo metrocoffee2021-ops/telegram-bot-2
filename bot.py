@@ -14,9 +14,6 @@ from dotenv import load_dotenv
 
 import db
 import menu_store
-import metropia_v2
-from manager import router as manager_router
-from web_dashboard import start_dashboard
 from handlers import router as customer_router, fmt_price
 from admin import router as admin_router, _aggregate, _format_report
 from texts import t
@@ -53,8 +50,7 @@ async def daily_summary_loop(bot: Bot, owner_id: int):
 
 
 async def birthday_loop(bot: Bot):
-    """Checks once a day for customers whose birthday is today and grants
-    them a free coffee automatically."""
+    """Checks once a day for birthdays and issues a 50% off one-drink reward."""
     while True:
         now = datetime.now(timezone.utc)
         today_key = now.strftime("%Y-%m-%d")
@@ -63,12 +59,13 @@ async def birthday_loop(bot: Bot):
         if now.hour == BIRTHDAY_CHECK_HOUR_UTC and already_sent != today_key:
             try:
                 for user_id in db.get_birthdays_today(month_day):
-                    db.grant_free_coffee(user_id)
-                    try:
-                        lang = db.get_user_language(user_id)
-                        await bot.send_message(user_id, t(lang, "birthday_gift_notice"))
-                    except Exception:
-                        pass  # customer may have blocked the bot
+                    reward = db.issue_birthday_reward(user_id, now.year)
+                    if reward.get("new"):
+                        try:
+                            lang = db.get_user_language(user_id)
+                            await bot.send_message(user_id, t(lang, "birthday_gift_notice"))
+                        except Exception:
+                            pass  # customer may have blocked the bot
             except Exception:
                 pass  # don't let a failed birthday check crash the whole bot
             db.set_setting("birthday_check_date", today_key)
@@ -83,14 +80,10 @@ async def main():
     db.init_db()
     menu_store.init_menu_tables()
     menu_store.seed_if_empty()
-    metropia_v2.init_v2()
-    metropia_v2.seed_branches()
-    start_dashboard()
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
-    dp.include_router(manager_router)
     dp.include_router(customer_router)
 
     owner_id = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))

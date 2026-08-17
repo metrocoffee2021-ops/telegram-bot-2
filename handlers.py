@@ -24,7 +24,6 @@ from menu_data import EXTRA_TOPPING_PRICE
 import menu_store
 import db
 import branches
-import metropia_v2
 
 router = Router()
 
@@ -448,6 +447,24 @@ def cart_total(user_id: int) -> int:
     return sum(entry["price"] * entry["qty"] for entry in CART.get(user_id, []))
 
 
+def birthday_discount_for_cart(user_id: int, item_index: int | None) -> int:
+    if item_index is None:
+        return 0
+    cart = CART.get(user_id, [])
+    if not (0 <= item_index < len(cart)):
+        return 0
+    entry = cart[item_index]
+    if entry.get("qty", 0) < 1:
+        return 0
+    return (int(entry["price"]) * db.BIRTHDAY_DISCOUNT_PERCENT) // 100
+
+
+def checkout_total(user_id: int, item_index: int | None) -> tuple[int, int]:
+    subtotal = cart_total(user_id)
+    discount = birthday_discount_for_cart(user_id, item_index)
+    return subtotal - discount, discount
+
+
 def cart_lines(cart: list[dict]) -> list[str]:
     """Plain-text lines — used for items_summary stored in the DB and shown in
     staff tools (/queue, tickets, /myorders) which aren't HTML-parsed. For the
@@ -591,16 +608,34 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
         await respond(target, t(lang, "cart_empty"))
         return
 
-    total = cart_total(user_id)
+    existing_state = await state.get_data() if state is not None else {}
+    birthday_item_index = existing_state.get("birthday_item_index")
+    subtotal = cart_total(user_id)
+    discount = birthday_discount_for_cart(user_id, birthday_item_index)
+    total = subtotal - discount
     text = (
         f"<b>{esc(t(lang, 'your_order'))}</b>\n"
         + "\n".join(cart_lines_html(cart))
-        + f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
     )
+    if discount:
+        text += f"\n\n{esc(t(lang, 'birthday_discount_line', percent=db.BIRTHDAY_DISCOUNT_PERCENT))}: -{fmt_price(discount)} so'm"
+    text += f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
     send = target.message.answer if isinstance(target, CallbackQuery) else target.answer
 
     if offer_payment and state is not None:
-        await state.set_data({"order_total": total})
+        active_reward = db.get_active_birthday_reward(user_id)
+        if active_reward and birthday_item_index is None:
+            kb = InlineKeyboardBuilder()
+            kb.button(text=t(lang, "birthday_choose_button"), callback_data="birthday_choose")
+            kb.button(text=t(lang, "birthday_skip_button"), callback_data="birthday_skip")
+            kb.adjust(1)
+            sent = await respond(target, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+            if not isinstance(target, CallbackQuery):
+                track_checkout_message(user_id, sent.message_id)
+            return
+        await state.set_data({"order_total": total, "birthday_item_index": birthday_item_index,
+                              "birthday_reward_id": active_reward["reward_id"] if active_reward and discount else None,
+                              "birthday_discount": discount})
 
         saved_phone = db.get_phone(user_id)
         if saved_phone:
@@ -802,13 +837,75 @@ async def location_not_shared(message: Message):
     track_checkout_message(message.from_user.id, sent.message_id)
 
 
+@router.callback_query(F.data == "birthday_skip")
+async def birthday_skip(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    for key in ("birthday_item_index", "birthday_reward_id", "birthday_discount"):
+        data.pop(key, None)
+    await state.set_data(data)
+    await show_cart(callback, offer_payment=True, state=state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "birthday_choose")
+async def birthday_choose(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    lang = lang_of(user_id)
+    reward = db.get_active_birthday_reward(user_id)
+    cart = CART.get(user_id, [])
+    if not reward or not cart:
+        await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    for idx, entry in enumerate(cart):
+        label = f"{entry['name']} — {fmt_price(entry['price'])} so'm"
+        if entry.get("size"):
+            label += f" · {entry['size']}"
+        kb.button(text=label, callback_data=f"birthday_item:{idx}")
+    kb.button(text=t(lang, "back_button"), callback_data="cart")
+    kb.adjust(1)
+    await respond(callback, t(lang, "birthday_choose_drink"), reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("birthday_item:"))
+async def birthday_item_selected(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    lang = lang_of(user_id)
+    reward = db.get_active_birthday_reward(user_id)
+    try:
+        item_index = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
+        return
+    discount = birthday_discount_for_cart(user_id, item_index)
+    if not reward or discount <= 0:
+        await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
+        return
+    await state.update_data(birthday_item_index=item_index, birthday_reward_id=reward["reward_id"],
+                            birthday_discount=discount)
+    await callback.answer(t(lang, "birthday_applied", discount=fmt_price(discount)))
+    await show_cart(callback, offer_payment=True, state=state)
+
+
 @router.callback_query(F.data.startswith("paymethod:"))
 async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     method = callback.data.split(":")[1]
     lang = lang_of(callback.from_user.id)
 
     data = await state.get_data()
-    total = data.get("order_total")
+    cart_snapshot = CART.get(callback.from_user.id, [])
+    birthday_item_index = data.get("birthday_item_index")
+    birthday_reward_id = data.get("birthday_reward_id")
+    subtotal = cart_total(callback.from_user.id)
+    discount = birthday_discount_for_cart(callback.from_user.id, birthday_item_index) if birthday_reward_id else 0
+    total = subtotal - discount
+    if birthday_reward_id:
+        reward = db.get_active_birthday_reward(callback.from_user.id)
+        if not reward or reward["reward_id"] != birthday_reward_id:
+            await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
+            await show_cart(callback, offer_payment=True, state=state)
+            return
     if total is None:
         # FSM state was lost (e.g. stale/duplicate bot instance, or the
         # session expired) — recover gracefully instead of crashing.
@@ -817,13 +914,13 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
         return
 
     order_id = f"order_{callback.from_user.id}_{int(time.time())}"
-    cart_snapshot = CART.get(callback.from_user.id, [])
     items_summary = "; ".join(cart_lines(cart_snapshot))
     db.create_order(
         order_id, callback.from_user.id, total, method,
         phone=data.get("phone"), branch_name=data.get("branch_name"), items_summary=items_summary,
         items_json=json.dumps(cart_snapshot), notes=data.get("notes"), pickup_time=data.get("pickup_time"),
-        delivery_address=data.get("delivery_address"),
+        delivery_address=data.get("delivery_address"), subtotal=subtotal, discount_amount=discount,
+        birthday_reward_id=birthday_reward_id,
     )
     await state.clear()
 
@@ -1024,6 +1121,12 @@ async def handle_pre_checkout(pre_checkout_query: PreCheckoutQuery):
         return
     order = db.get_order(payload)
     if order and order["status"] == "pending":
+        if order.get("birthday_reward_id"):
+            reward = db.get_active_birthday_reward(pre_checkout_query.from_user.id)
+            if not reward or reward["reward_id"] != order["birthday_reward_id"]:
+                lang = lang_of(pre_checkout_query.from_user.id)
+                await pre_checkout_query.answer(ok=False, error_message=t(lang, "birthday_reward_unavailable"))
+                return
         await pre_checkout_query.answer(ok=True)
     else:
         lang = lang_of(pre_checkout_query.from_user.id)
@@ -1332,7 +1435,6 @@ async def claim_order(callback: CallbackQuery):
         return
 
     order = db.get_order(order_id)
-    metropia_v2.event(order_id, "preparing", staff_name, "Order claimed")
     customer_label = order_customer_label(order)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Mark ready", callback_data=f"markready:{order_id}")
@@ -1356,7 +1458,6 @@ async def mark_order_ready(callback: CallbackQuery):
 
     db.mark_order_ready_notified(order_id)
     db.mark_order_prep_ready(order_id)
-    metropia_v2.event(order_id, "ready", callback.from_user.full_name, "Order marked ready")
     customer_lang = lang_of(order["user_id"])
     try:
         rating_kb = InlineKeyboardBuilder()
