@@ -101,17 +101,18 @@ async def respond(target, text: str, reply_markup=None):
     this EDITS that same message in place instead of sending a new one — so
     browsing the menu doesn't flood the chat with dozens of old messages.
     When reached via a typed command (no previous bot message to edit), it
-    just sends normally."""
+    just sends normally. Returns the resulting message, so callers can track
+    it with track_checkout_message() if it needs cleaning up later."""
     if isinstance(target, CallbackQuery):
         try:
-            await target.message.edit_text(text, reply_markup=reply_markup)
+            return await target.message.edit_text(text, reply_markup=reply_markup)
         except Exception:
             # message has no editable text (e.g. was a photo), or content is
             # byte-for-byte identical to what's already shown — either way,
             # falling back to a fresh message is always safe.
-            await target.message.answer(text, reply_markup=reply_markup)
+            return await target.message.answer(text, reply_markup=reply_markup)
     else:
-        await target.answer(text, reply_markup=reply_markup)
+        return await target.answer(text, reply_markup=reply_markup)
 
 
 def add_nav_row(kb: InlineKeyboardBuilder, lang: str, back_callback: str):
@@ -215,6 +216,7 @@ async def onboarding_name_received(message: Message, state: FSMContext):
         return
 
     db.save_full_name(message.from_user.id, name)
+    track_checkout_message(message.from_user.id, message.message_id)  # their typed name — cleaned up after order
     # straight into the normal checkout flow — this was the only thing gating it
     await show_cart(message, offer_payment=True, state=state)
 
@@ -556,7 +558,9 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
             # already have their number from a past order — skip straight to
             # fulfillment instead of asking them to share it again every time
             await state.update_data(phone=saved_phone)
-            await respond(target, text)
+            sent = await respond(target, text)
+            if not isinstance(target, CallbackQuery):
+                track_checkout_message(user_id, sent.message_id)
             await ask_fulfillment(user_id, lang, send=send)
             return
 
@@ -566,7 +570,9 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await respond(target, text)
+        sent = await respond(target, text)
+        if not isinstance(target, CallbackQuery):
+            track_checkout_message(user_id, sent.message_id)
         # A ReplyKeyboardMarkup can't be attached to an edited message in Telegram —
         # this one new message is unavoidable, everything else in the flow is edited in place.
         contact_msg = await send(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
@@ -589,6 +595,7 @@ async def contact_received(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
     await state.update_data(phone=message.contact.phone_number)
     db.save_phone(message.from_user.id, message.contact.phone_number)  # remember it for next time
+    track_checkout_message(message.from_user.id, message.message_id)  # their "shared contact" bubble
     await ask_fulfillment(message.from_user.id, lang, send=message.answer)
 
 
@@ -654,6 +661,7 @@ async def contact_not_shared(message: Message):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+    track_checkout_message(message.from_user.id, message.message_id)
     sent = await message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
     track_checkout_message(message.from_user.id, sent.message_id)
 
@@ -676,6 +684,7 @@ async def location_received(message: Message, state: FSMContext):
             t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
             reply_markup=ReplyKeyboardRemove(),
         )
+    track_checkout_message(message.from_user.id, message.message_id)  # their "shared location" bubble
     track_checkout_message(message.from_user.id, sent1.message_id)
     await ask_notes(message.from_user.id, lang, state, send=message.answer)
 
@@ -686,6 +695,7 @@ async def notes_received(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text and text.lower() not in {"skip", "o'tkazib yuborish", "пропустить", "-"}:
         await state.update_data(notes=text)
+    track_checkout_message(message.from_user.id, message.message_id)  # their typed note (or "skip")
     await prompt_pickup_time(message.bot, message.from_user.id, lang, state, send=message.answer)
 
 
@@ -738,6 +748,7 @@ async def location_not_shared(message: Message):
         resize_keyboard=True,
         one_time_keyboard=True,
     )
+    track_checkout_message(message.from_user.id, message.message_id)
     sent = await message.answer(t(lang, "share_location_prompt"), reply_markup=location_kb)
     track_checkout_message(message.from_user.id, sent.message_id)
 
