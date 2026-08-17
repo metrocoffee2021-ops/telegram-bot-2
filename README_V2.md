@@ -6,11 +6,11 @@ This is the consolidated deployment package built on the existing Metropia Coffe
 - Customer menu, cart, checkout and Telegram payments
 - Cash / Click / Payme flows from the existing bot
 - Loyalty stamps
-- Birthday reward: 50% off one drink, valid 7 days, once per calendar year
+- Birthday reward: 50% off one drink, valid 7 days, once per calendar year (configurable in Manager)
 - Owner `/admin` menu editor
 - Owner `/manager` business manager
-- Persistent branch/location management
-- Persistent promotion CRUD (percentage/fixed)
+- Persistent branch/location management (add/edit/activate/deactivate/delete)
+- Persistent promotion CRUD (create/edit/activate/deactivate/delete; percentage/fixed)
 - Promo-code checkout support via `/promo CODE`
 - Staff order queue and existing order workflow
 - Daily sales reporting
@@ -40,7 +40,7 @@ The application loads `.env` before importing admin/handler modules, so owner au
 - Products: opens the existing full `/admin` editor
 - Orders: open-order view
 - Analytics: today's order/revenue summary
-- Birthday: current 50% reward policy
+- Birthday: edit discount and validity settings
 
 ## Promotions
 Create a promotion in Manager, activate it, then a customer can enter `/promo CODE`. The active percentage/fixed discount is applied to the current cart at checkout. Birthday discount takes priority and does not stack.

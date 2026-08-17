@@ -4,7 +4,7 @@
 
 TEXTS = {
     "uz": {
-        "choose_language": "Tilni tanlang / Выберите язык / Choose language:",
+        "choose_language": "Tilni tanlang / Choose language:",
         "welcome": "Metropia Coffee botiga xush kelibsiz! ☕\nSizning kofe joyingiz...",
         "menu_button": "📋 Menyu",
         "back_button": "⬅️ Orqaga",
@@ -148,7 +148,7 @@ TEXTS = {
         "admin_winback_sent": "{count} ta mijozga yuborildi.",
         "birthday_usage": "Foydalanish: /birthday DD-MM\nMasalan: /birthday 15-03",
         "birthday_invalid": "Noto'g'ri sana. Masalan: /birthday 15-03",
-        "birthday_saved": "Tug'ilgan kuningiz saqlandi 🎂 Shu kuni sizga bepul ichimlik sovg'a qilamiz!",
+        "birthday_saved": "Tug'ilgan kuningiz saqlandi 🎂 Tug'ilgan kuningizda sizga 1 ta ichimlik uchun 50% chegirma beramiz.",
         "birthday_gift_notice": "🎂 Tug'ilgan kuningiz muborak! Sizga bitta ichimlik uchun 50% chegirma sovg'a qildik. 7 kun amal qiladi.",
         "birthday_choose_button": "🎂 50% tug‘ilgan kun chegirmasidan foydalanish",
         "birthday_skip_button": "Keyinroq — chegirmasiz davom etish",
@@ -341,7 +341,7 @@ TEXTS = {
         "admin_winback_sent": "Отправлено {count} клиентам.",
         "birthday_usage": "Использование: /birthday ДД-ММ\nНапример: /birthday 15-03",
         "birthday_invalid": "Неверная дата. Например: /birthday 15-03",
-        "birthday_saved": "Ваш день рождения сохранён 🎂 В этот день вы получите бесплатный напиток!",
+        "birthday_saved": "Ваш день рождения сохранён 🎂 В день рождения вы получите скидку 50% на один напиток.",
         "birthday_gift_notice": "🎂 С днём рождения! Подарок: скидка 50% на один напиток. Действует 7 дней.",
         "birthday_choose_button": "🎂 Использовать скидку 50%",
         "birthday_skip_button": "Продолжить без скидки",
@@ -528,7 +528,7 @@ TEXTS = {
         "admin_winback_sent": "Sent to {count} customers.",
         "birthday_usage": "Usage: /birthday DD-MM\nExample: /birthday 15-03",
         "birthday_invalid": "Invalid date. Example: /birthday 15-03",
-        "birthday_saved": "Your birthday is saved 🎂 You'll get a free drink that day!",
+        "birthday_saved": "Your birthday is saved 🎂 On your birthday, you'll get 50% off one drink.",
         "birthday_gift_notice": "🎂 Happy birthday! Your gift is 50% off one drink. Valid for 7 days.",
         "birthday_choose_button": "🎂 Use my 50% birthday discount",
         "birthday_skip_button": "Continue without discount",

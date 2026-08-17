@@ -106,10 +106,23 @@ def promo_label(lang, key):
 
 def promotion_discount(user_id, code, subtotal):
     if not code: return (0,None)
+    now = datetime.utcnow()
     for p in db.list_promotions():
-        if p["active"] and p["code"].upper()==code.strip().upper():
-            if p["kind"]=="percent": return (min(subtotal, subtotal*p["value"]//100), p)
-            return (min(subtotal,p["value"]),p)
+        if not p["active"] or p["code"].upper() != code.strip().upper():
+            continue
+        try:
+            if p.get("starts_at") and now < datetime.fromisoformat(p["starts_at"].replace("Z", "+00:00")).replace(tzinfo=None):
+                continue
+            if p.get("ends_at") and now > datetime.fromisoformat(p["ends_at"].replace("Z", "+00:00")).replace(tzinfo=None):
+                continue
+        except ValueError:
+            continue
+        if p.get("max_uses", 0) and p.get("used_count", 0) >= p["max_uses"]:
+            continue
+        if subtotal < (p.get("min_subtotal") or 0):
+            continue
+        if p["kind"]=="percent": return (min(subtotal, subtotal*p["value"]//100), p)
+        return (min(subtotal,p["value"]),p)
     return (0,None)
 
 
@@ -208,6 +221,7 @@ async def my_orders_button_pressed(message: Message):
 @router.message(CommandStart())
 async def start(message: Message):
     db.save_username(message.from_user.id, message.from_user.username)
+    CART[message.from_user.id] = db.load_cart(message.from_user.id)
 
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1 and parts[1].startswith("ref_"):
@@ -279,7 +293,7 @@ async def show_categories(target):
         kb.button(text=f"{cat['emoji']} {name}", callback_data=f"cat:{cat['id']}")
     kb.adjust(2)
     header = f"<b>{esc(t(lang, 'choose_category'))}</b>"
-    cart = CART.get(user_id, [])
+    cart = ensure_cart(user_id)
     if cart:
         qty = sum(entry.get("qty", 1) for entry in cart)
         header += "\n" + t(lang, "cart_summary_line", qty=qty, total=fmt_price(cart_total(user_id)))
@@ -423,8 +437,9 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
             entry["qty"] += 1
             break
     else:
-        cart.append({"name": name, "price": price, "temp": temp, "size": size, "topping": topping, "qty": 1})
+        cart.append({"name": name, "item_id": item_id, "price": price, "temp": temp, "size": size, "topping": topping, "qty": 1})
 
+    db.save_cart(callback.from_user.id, cart)
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
     kb.button(text=t(lang, "cart_button"), callback_data="cart")
@@ -435,6 +450,11 @@ async def add_to_cart(callback: CallbackQuery, item_id: int, temp: str, size: st
 # in-memory cart per user — cleared after a successful checkout. Lost if the bot restarts
 # mid-order, which is an acceptable tradeoff for a small shop (customer just re-adds items).
 CART: dict[int, list[dict]] = {}
+
+def ensure_cart(user_id: int) -> list[dict]:
+    if user_id not in CART:
+        CART[user_id] = db.load_cart(user_id)
+    return CART[user_id]
 
 # Tracks bot messages sent during checkout (contact/fulfillment/location/notes/pickup-time
 # prompts) so they can all be deleted once the order completes — customers have a Back
@@ -464,19 +484,19 @@ async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_yo
 
 
 def cart_total(user_id: int) -> int:
-    return sum(entry["price"] * entry["qty"] for entry in CART.get(user_id, []))
+    return sum(entry["price"] * entry["qty"] for entry in ensure_cart(user_id))
 
 
 def birthday_discount_for_cart(user_id: int, item_index: int | None) -> int:
     if item_index is None:
         return 0
-    cart = CART.get(user_id, [])
+    cart = ensure_cart(user_id)
     if not (0 <= item_index < len(cart)):
         return 0
     entry = cart[item_index]
     if entry.get("qty", 0) < 1:
         return 0
-    return (int(entry["price"]) * db.BIRTHDAY_DISCOUNT_PERCENT) // 100
+    return (int(entry["price"]) * db.get_birthday_discount_percent()) // 100
 
 
 def checkout_total(user_id: int, item_index: int | None) -> tuple[int, int]:
@@ -537,7 +557,7 @@ async def noop(callback: CallbackQuery):
 async def show_cart_editable(target):
     user_id = target.from_user.id
     lang = lang_of(user_id)
-    cart = CART.get(user_id, [])
+    cart = ensure_cart(user_id)
     if not cart:
         kb = InlineKeyboardBuilder()
         kb.button(text=t(lang, "menu_button"), callback_data="menu")
@@ -568,7 +588,7 @@ async def show_cart_editable(target):
 @router.callback_query(F.data.startswith("cartinc:"))
 async def cart_increment(callback: CallbackQuery):
     index = int(callback.data.split(":")[1])
-    cart = CART.get(callback.from_user.id, [])
+    cart = ensure_cart(callback.from_user.id)
     if 0 <= index < len(cart):
         cart[index]["qty"] += 1
     await show_cart_editable(callback)
@@ -578,11 +598,12 @@ async def cart_increment(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("cartdec:"))
 async def cart_decrement(callback: CallbackQuery):
     index = int(callback.data.split(":")[1])
-    cart = CART.get(callback.from_user.id, [])
+    cart = ensure_cart(callback.from_user.id)
     if 0 <= index < len(cart):
         cart[index]["qty"] -= 1
         if cart[index]["qty"] <= 0:
             cart.pop(index)
+    db.save_cart(callback.from_user.id, cart)
     await show_cart_editable(callback)
     await callback.answer()
 
@@ -590,6 +611,7 @@ async def cart_decrement(callback: CallbackQuery):
 @router.callback_query(F.data == "clearcart")
 async def cart_clear(callback: CallbackQuery):
     CART[callback.from_user.id] = []
+    db.clear_cart(callback.from_user.id)
     await show_cart_editable(callback)
     await callback.answer(t(lang_of(callback.from_user.id), "cart_cleared"))
 
@@ -617,7 +639,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
     `send` lookup below handle either case."""
     user_id = target.from_user.id
     lang = lang_of(user_id)
-    cart = CART.get(user_id, [])
+    cart = ensure_cart(user_id)
     if not cart:
         await respond(target, t(lang, "cart_empty"))
         return
@@ -634,7 +656,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
         + "\n".join(cart_lines_html(cart))
     )
     if birthday_discount:
-        text += f"\n\n{esc(t(lang, 'birthday_discount_line', percent=db.BIRTHDAY_DISCOUNT_PERCENT))}: -{fmt_price(birthday_discount)} so'm"
+        text += f"\n\n{esc(t(lang, 'birthday_discount_line', percent=db.get_birthday_discount_percent()))}: -{fmt_price(birthday_discount)} so'm"
     elif promo_discount:
         text += f"\n\n{esc(promo_label(lang, 'applied').format(discount=fmt_price(promo_discount)))}"
     text += f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
@@ -744,8 +766,10 @@ async def prompt_payment(user_id: int, lang: str, state: FSMContext, send):
         summary += f"\n🎁 -{fmt_price(discount)} so'm"
     summary += f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
     kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Click", callback_data="paymethod:click")
-    kb.button(text="💳 Payme", callback_data="paymethod:payme")
+    if PROVIDER_TOKENS.get("click"):
+        kb.button(text="💳 Click", callback_data="paymethod:click")
+    if PROVIDER_TOKENS.get("payme"):
+        kb.button(text="💳 Payme", callback_data="paymethod:payme")
     kb.button(text=t(lang, "cash_payment_button"), callback_data="paymethod:cash")
     kb.button(text={"uz":"🎟 Promo","ru":"🎟 Промокод","en":"🎟 Promo code"}[lang], callback_data="promo_enter")
     kb.button(text={"uz":"🏪 Filial","ru":"🏪 Филиал","en":"🏪 Branch"}[lang], callback_data="choosebranch")
@@ -937,12 +961,17 @@ async def birthday_choose(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     lang = lang_of(user_id)
     reward = db.get_active_birthday_reward(user_id)
-    cart = CART.get(user_id, [])
+    cart = ensure_cart(user_id)
     if not reward or not cart:
         await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
         return
     kb = InlineKeyboardBuilder()
+    eligible_count = 0
     for idx, entry in enumerate(cart):
+        item = menu_store.get_item(int(entry.get("item_id", 0)))
+        if not item or not item.get("birthday_eligible", True):
+            continue
+        eligible_count += 1
         label = f"{entry['name']} — {fmt_price(entry['price'])} so'm"
         if entry.get("size"):
             label += f" · {entry['size']}"
@@ -958,13 +987,17 @@ async def birthday_item_selected(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     lang = lang_of(user_id)
     reward = db.get_active_birthday_reward(user_id)
+    cart = ensure_cart(user_id)
     try:
         item_index = int(callback.data.split(":", 1)[1])
     except ValueError:
         await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
         return
     discount = birthday_discount_for_cart(user_id, item_index)
-    if not reward or discount <= 0:
+    entry = cart[item_index] if 0 <= item_index < len(cart) else None
+    item = menu_store.get_item(int(entry.get("item_id", 0))) if entry else None
+    drink_like = bool(item and item.get("birthday_eligible", True))
+    if not reward or discount <= 0 or not drink_like:
         await callback.answer(t(lang, "birthday_reward_unavailable"), show_alert=True)
         return
     await state.update_data(birthday_item_index=item_index, birthday_reward_id=reward["reward_id"],
@@ -1006,7 +1039,7 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
 
     data = await state.get_data()
-    cart_snapshot = CART.get(callback.from_user.id, [])
+    cart_snapshot = ensure_cart(callback.from_user.id)
     birthday_item_index = data.get("birthday_item_index")
     birthday_reward_id = data.get("birthday_reward_id")
     subtotal = cart_total(callback.from_user.id)
@@ -1029,12 +1062,19 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
 
     order_id = f"order_{callback.from_user.id}_{int(time.time())}"
     items_summary = "; ".join(cart_lines(cart_snapshot))
+
+    # Validate provider configuration BEFORE creating a pending order.
+    provider_token = PROVIDER_TOKENS.get(method, "")
+    if method not in ("cash", "bundle") and not provider_token:
+        await callback.answer(t(lang, "payment_error"), show_alert=True)
+        return
+
     db.create_order(
         order_id, callback.from_user.id, total, method,
         phone=data.get("phone"), branch_name=data.get("branch_name"), items_summary=items_summary,
         items_json=json.dumps(cart_snapshot), notes=data.get("notes"), pickup_time=data.get("pickup_time"),
         delivery_address=data.get("delivery_address"), subtotal=subtotal, discount_amount=discount,
-        birthday_reward_id=birthday_reward_id,
+        birthday_reward_id=birthday_reward_id, promo_code=data.get("promo_code"),
     )
     await state.clear()
 
@@ -1044,11 +1084,6 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
 
     if method == "bundle":
         await handle_bundle_checkout(callback, order_id, cart_snapshot, lang)
-        return
-
-    provider_token = PROVIDER_TOKENS.get(method, "")
-    if not provider_token:
-        await callback.answer(t(lang, "payment_error"), show_alert=True)
         return
 
     # Telegram invoice amounts are in the smallest currency unit — for UZS
@@ -1095,6 +1130,8 @@ async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str
         except Exception as e:
             print(f"[cash-checkout] FAILED to notify chat_id={notify_chat_id}: {e}")
 
+    CART[callback.from_user.id] = []
+    db.clear_cart(callback.from_user.id)
     await cleanup_checkout_messages(callback.bot, callback.from_user.id)
     await callback.message.answer(t(lang, "cash_order_placed_customer"))
     await callback.answer()
@@ -1114,6 +1151,7 @@ async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_sn
     result = db.add_stamp(callback.from_user.id)
     await apply_referral_bonus_if_applicable(callback.bot, callback.from_user.id)
     CART[callback.from_user.id] = []
+    db.clear_cart(callback.from_user.id)
 
     reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
     order = db.get_order(order_id)
@@ -1264,6 +1302,7 @@ async def handle_successful_payment(message: Message):
     result = db.add_stamp(message.from_user.id)
     await apply_referral_bonus_if_applicable(message.bot, message.from_user.id)
     CART[message.from_user.id] = []
+    db.clear_cart(message.from_user.id)
 
     order = db.get_order(order_id)
     reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
@@ -1623,19 +1662,23 @@ async def set_birthday(message: Message):
         await message.answer(t(lang, "birthday_invalid"))
         return
     try:
-        # accept either DD-MM or MM-DD by checking which segment can be a valid month
         a, b = int(segments[0]), int(segments[1])
-        if 1 <= a <= 12 and not (1 <= b <= 12 and b <= 12 < a):
+        # User-facing format is DD-MM; also accept MM-DD for compatibility.
+        if 1 <= a <= 31 and 1 <= b <= 12:
+            day, month = a, b
+        elif 1 <= a <= 12 and 1 <= b <= 31:
             month, day = a, b
         else:
-            month, day = b, a
-        if not (1 <= month <= 12 and 1 <= day <= 31):
             raise ValueError
+        datetime(2000, month, day)  # real calendar validation (incl. Feb 29)
         month_day = f"{month:02d}-{day:02d}"
     except ValueError:
         await message.answer(t(lang, "birthday_invalid"))
         return
     db.save_birthday(message.from_user.id, month_day)
+    local_today = (datetime.utcnow() + timedelta(hours=5)).strftime("%m-%d")
+    if month_day == local_today:
+        db.issue_birthday_reward(message.from_user.id, (datetime.utcnow() + timedelta(hours=5)).year)
     await message.answer(t(lang, "birthday_saved"))
 
 
@@ -1675,6 +1718,7 @@ async def reorder(callback: CallbackQuery):
         entry.setdefault("qty", 1)
     cart = CART.setdefault(callback.from_user.id, [])
     cart.extend(items)
+    db.save_cart(callback.from_user.id, cart)
     await callback.answer(t(lang, "items_added_to_cart"), show_alert=False)
     await show_cart_editable(callback)
 

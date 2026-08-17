@@ -6,7 +6,7 @@
 import asyncio
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -22,7 +22,7 @@ from manager import router as manager_router
 logging.basicConfig(level=logging.INFO)
 
 DAILY_SUMMARY_HOUR_UTC = 17  # ~22:00 Tashkent time (UTC+5) — edit this if the shop's hours change
-BIRTHDAY_CHECK_HOUR_UTC = 4  # ~09:00 Tashkent time — sends birthday rewards early in the day
+BIRTHDAY_CHECK_HOUR_UTC = 4  # retained for backwards compatibility; birthday_loop now runs once per local day
 
 
 async def daily_summary_loop(bot: Bot, owner_id: int):
@@ -51,11 +51,13 @@ async def daily_summary_loop(bot: Bot, owner_id: int):
 async def birthday_loop(bot: Bot):
     """Checks once a day for birthdays and issues a 50% off one-drink reward."""
     while True:
-        now = datetime.now(timezone.utc)
+        # Metropia operates on Tashkent time (UTC+5). Run once per local calendar day,
+        # regardless of when the process started, so a restart cannot skip birthdays.
+        now = datetime.now(timezone.utc) + timedelta(hours=5)
         today_key = now.strftime("%Y-%m-%d")
         month_day = now.strftime("%m-%d")
         already_sent = db.get_setting("birthday_check_date")
-        if now.hour == BIRTHDAY_CHECK_HOUR_UTC and already_sent != today_key:
+        if already_sent != today_key:
             try:
                 for user_id in db.get_birthdays_today(month_day):
                     reward = db.issue_birthday_reward(user_id, now.year)
