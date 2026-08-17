@@ -81,6 +81,10 @@ def init_db():
         _add_column_if_missing(conn, "orders", "pickup_time", "TEXT")
         _add_column_if_missing(conn, "orders", "delivery_address", "TEXT")
         _add_column_if_missing(conn, "orders", "used_bundle_credit", "INTEGER DEFAULT 0")
+        _add_column_if_missing(conn, "users", "full_name", "TEXT")
+        _add_column_if_missing(conn, "users", "home_branch", "TEXT")
+        _add_column_if_missing(conn, "users", "home_lat", "REAL")
+        _add_column_if_missing(conn, "users", "home_lng", "REAL")
         conn.execute("""CREATE TABLE IF NOT EXISTS referrals (
             referred_id INTEGER PRIMARY KEY,
             referrer_id INTEGER,
@@ -133,6 +137,68 @@ def get_all_user_ids() -> list[int]:
     with get_db() as conn:
         rows = conn.execute("SELECT user_id FROM users").fetchall()
     return [r[0] for r in rows]
+
+
+# ---- onboarding profile (name, saved phone, home branch) ----
+
+def save_full_name(user_id: int, full_name: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, full_name) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET full_name = ?",
+            (user_id, full_name, full_name),
+        )
+
+
+def get_full_name(user_id: int) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT full_name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+def save_phone(user_id: int, phone: str):
+    """Remembers the customer's phone number so checkout doesn't need to ask again."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, phone) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET phone = ?",
+            (user_id, phone, phone),
+        )
+
+
+def get_phone(user_id: int) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT phone FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row else None
+
+
+def save_home_branch(user_id: int, branch_name: str, lat: float, lng: float):
+    """Remembers the customer's nearest branch so pickup checkout doesn't need to ask
+    for location again. Call this again any time a customer shares a fresher location
+    (e.g. via the 'change branch' option), so it stays accurate as they move around."""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, home_branch, home_lat, home_lng) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET home_branch = ?, home_lat = ?, home_lng = ?",
+            (user_id, branch_name, lat, lng, branch_name, lat, lng),
+        )
+
+
+def get_home_branch(user_id: int) -> dict | None:
+    """Returns {'name': ..., 'address': ...} for the customer's saved nearest branch,
+    or None if they haven't shared a location yet."""
+    import branches
+    with get_db() as conn:
+        row = conn.execute("SELECT home_branch FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if not row or not row[0]:
+        return None
+    for b in branches.BRANCHES:
+        if b["name"] == row[0]:
+            return b
+    return {"name": row[0], "address": ""}  # branch was renamed/removed since — name still shown
+
+
+def is_onboarded(user_id: int) -> bool:
+    """True once the welcome flow (name/location/phone) has been completed."""
+    return bool(get_full_name(user_id))
 
 
 # ---- loyalty (stamp card) ----
@@ -261,6 +327,26 @@ def get_order(order_id: str) -> dict | None:
         "order_number": row[12], "prep_status": row[13], "claimed_by_name": row[14],
         "pickup_time": row[15], "delivery_address": row[16], "rating": row[17],
     }
+
+
+def get_open_orders() -> list[dict]:
+    """Paid orders that aren't marked ready yet — new (unclaimed) and preparing
+    (claimed) — oldest first, for the staff /queue view."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT order_id, order_number, prep_status, claimed_by_name, branch_name, "
+            "items_summary, pickup_time, created_at "
+            "FROM orders WHERE status = 'paid' AND prep_status IN ('new', 'preparing') "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+    return [
+        {
+            "order_id": r[0], "order_number": r[1], "prep_status": r[2],
+            "claimed_by_name": r[3], "branch_name": r[4],
+            "items_summary": r[5], "pickup_time": r[6], "created_at": r[7],
+        }
+        for r in rows
+    ]
 
 
 def assign_order_number(order_id: str, today_str: str) -> int:

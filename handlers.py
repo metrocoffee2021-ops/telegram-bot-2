@@ -45,6 +45,14 @@ class OrderFlow(StatesGroup):
     choosing_payment_method = State()  # button-only step; no message handler here on purpose
 
 
+class OnboardingFlow(StatesGroup):
+    """A customer's name is asked exactly once, the first time they hit
+    Checkout — not before, so nothing blocks them from browsing the menu.
+    Phone number and nearest branch are already handled by the normal
+    checkout steps below (and skipped automatically once saved)."""
+    awaiting_name = State()
+
+
 # ---------- helpers ----------
 
 def fmt_price(amount: int) -> str:
@@ -119,6 +127,49 @@ def main_menu_keyboard(lang: str):
     return kb.as_markup()
 
 
+def persistent_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    """A bottom keyboard that stays visible at all times, so customers don't
+    need to remember commands like /menu or /stamps. It coexists fine with the
+    inline buttons used elsewhere — this doesn't replace those, just adds a
+    always-there shortcut bar. is_persistent=True keeps it showing even while
+    inline keyboards are also on screen (aiogram 3.x / Bot API 6.7+)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "menu_button")), KeyboardButton(text=t(lang, "cart_button"))],
+            [KeyboardButton(text=t(lang, "stamps_button")), KeyboardButton(text=t(lang, "my_orders_button"))],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+_ALL_LANGS = ("uz", "ru", "en")
+MENU_BUTTON_TEXTS = {t(l, "menu_button") for l in _ALL_LANGS}
+CART_BUTTON_TEXTS = {t(l, "cart_button") for l in _ALL_LANGS}
+STAMPS_BUTTON_TEXTS = {t(l, "stamps_button") for l in _ALL_LANGS}
+MY_ORDERS_BUTTON_TEXTS = {t(l, "my_orders_button") for l in _ALL_LANGS}
+
+
+@router.message(F.text.in_(MENU_BUTTON_TEXTS))
+async def menu_button_pressed(message: Message):
+    await show_categories(message)
+
+
+@router.message(F.text.in_(CART_BUTTON_TEXTS))
+async def cart_button_pressed(message: Message):
+    await show_cart_editable(message)
+
+
+@router.message(F.text.in_(STAMPS_BUTTON_TEXTS))
+async def stamps_button_pressed(message: Message):
+    await show_stamps(message.from_user.id, message.answer)
+
+
+@router.message(F.text.in_(MY_ORDERS_BUTTON_TEXTS))
+async def my_orders_button_pressed(message: Message):
+    await my_orders_command(message)
+
+
 # ---------- language ----------
 
 @router.message(CommandStart())
@@ -134,9 +185,9 @@ async def start(message: Message):
             pass
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="O'zbek", callback_data="lang:uz")
-    kb.button(text="Русский", callback_data="lang:ru")
-    kb.button(text="English", callback_data="lang:en")
+    kb.button(text="🇺🇿 O'zbek", callback_data="lang:uz")
+    kb.button(text="🇷🇺 Русский", callback_data="lang:ru")
+    kb.button(text="🇺🇸 English", callback_data="lang:en")
     kb.adjust(3)
     await message.answer(t("en", "choose_language"), reply_markup=kb.as_markup())
 
@@ -147,7 +198,25 @@ async def set_language(callback: CallbackQuery):
     db.save_user_language(callback.from_user.id, lang)
     db.save_username(callback.from_user.id, callback.from_user.username)
     await callback.message.answer(t(lang, "welcome"), reply_markup=main_menu_keyboard(lang))
+    # a second message just to attach the persistent bottom keyboard — Telegram
+    # only allows one reply_markup per message, and this one is inline already
+    await callback.message.answer(t(lang, "shortcuts_ready"), reply_markup=persistent_keyboard(lang))
     await callback.answer()
+
+
+# ---------- one-time name ask, folded into first checkout instead of blocking browsing ----------
+
+@router.message(OnboardingFlow.awaiting_name)
+async def onboarding_name_received(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer(t(lang, "onboarding_name_invalid"))
+        return
+
+    db.save_full_name(message.from_user.id, name)
+    # straight into the normal checkout flow — this was the only thing gating it
+    await show_cart(message, offer_payment=True, state=state)
 
 
 # ---------- menu browsing (reads from the database) ----------
@@ -174,7 +243,12 @@ async def show_categories(target):
     for cat in categories:
         kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
     kb.adjust(2)
-    await respond(target, t(lang, "choose_category"), reply_markup=kb.as_markup())
+    header = t(lang, "choose_category")
+    cart = CART.get(user_id, [])
+    if cart:
+        qty = sum(entry.get("qty", 1) for entry in cart)
+        header += "\n" + t(lang, "cart_summary_line", qty=qty, total=fmt_price(cart_total(user_id)))
+    await respond(target, header, reply_markup=kb.as_markup())
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -445,49 +519,97 @@ async def checkout_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer(t(lang, "ordering_paused_notice"), show_alert=True)
         return
     CHECKOUT_MESSAGES[callback.from_user.id] = [callback.message.message_id]
+
+    if not db.is_onboarded(callback.from_user.id):
+        # first-ever checkout for this customer — ask their name once, right here,
+        # instead of making them answer it before they could even see the menu
+        await state.set_state(OnboardingFlow.awaiting_name)
+        sent = await callback.message.answer(t(lang, "onboarding_ask_name"))
+        track_checkout_message(callback.from_user.id, sent.message_id)
+        await callback.answer()
+        return
+
     await show_cart(callback, offer_payment=True, state=state)
     await callback.answer()
 
 
-async def show_cart(callback: CallbackQuery, offer_payment: bool = False, state: FSMContext = None):
-    user_id = callback.from_user.id
+async def show_cart(target, offer_payment: bool = False, state: FSMContext = None):
+    """`target` can be the CallbackQuery from tapping Checkout, or a plain Message
+    (used right after a first-time customer types their name) — respond() and the
+    `send` lookup below handle either case."""
+    user_id = target.from_user.id
     lang = lang_of(user_id)
     cart = CART.get(user_id, [])
     if not cart:
-        await respond(callback, t(lang, "cart_empty"))
+        await respond(target, t(lang, "cart_empty"))
         return
 
     total = cart_total(user_id)
     text = t(lang, "your_order") + "\n" + "\n".join(cart_lines(cart)) + f"\n\n{t(lang, 'total')}: {fmt_price(total)} so'm"
+    send = target.message.answer if isinstance(target, CallbackQuery) else target.answer
 
     if offer_payment and state is not None:
         await state.set_data({"order_total": total})
+
+        saved_phone = db.get_phone(user_id)
+        if saved_phone:
+            # already have their number from a past order — skip straight to
+            # fulfillment instead of asking them to share it again every time
+            await state.update_data(phone=saved_phone)
+            await respond(target, text)
+            await ask_fulfillment(user_id, lang, send=send)
+            return
+
         await state.set_state(OrderFlow.awaiting_contact)
         contact_kb = ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)]],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        await respond(callback, text)
+        await respond(target, text)
         # A ReplyKeyboardMarkup can't be attached to an edited message in Telegram —
         # this one new message is unavoidable, everything else in the flow is edited in place.
-        contact_msg = await callback.message.answer(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
+        contact_msg = await send(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
         track_checkout_message(user_id, contact_msg.message_id)
     else:
-        await respond(callback, text)
+        await respond(target, text)
+
+
+async def ask_fulfillment(user_id: int, lang: str, send):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "fulfillment_pickup_button"), callback_data="fulfillment:pickup")
+    kb.button(text=t(lang, "fulfillment_delivery_button"), callback_data="fulfillment:delivery")
+    kb.adjust(2)
+    sent = await send(t(lang, "choose_fulfillment"), reply_markup=kb.as_markup())
+    track_checkout_message(user_id, sent.message_id)
 
 
 @router.message(OrderFlow.awaiting_contact, F.contact)
 async def contact_received(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
     await state.update_data(phone=message.contact.phone_number)
+    db.save_phone(message.from_user.id, message.contact.phone_number)  # remember it for next time
+    await ask_fulfillment(message.from_user.id, lang, send=message.answer)
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text=t(lang, "fulfillment_pickup_button"), callback_data="fulfillment:pickup")
-    kb.button(text=t(lang, "fulfillment_delivery_button"), callback_data="fulfillment:delivery")
-    kb.adjust(2)
-    sent = await message.answer(t(lang, "choose_fulfillment"), reply_markup=kb.as_markup())
-    track_checkout_message(message.from_user.id, sent.message_id)
+
+async def ask_notes(user_id: int, lang: str, state: FSMContext, send):
+    skip_kb = InlineKeyboardBuilder()
+    skip_kb.button(text=t(lang, "skip_notes_button"), callback_data="skipnotes")
+    sent = await send(t(lang, "ask_notes"), reply_markup=skip_kb.as_markup())
+    track_checkout_message(user_id, sent.message_id)
+    await state.set_state(OrderFlow.awaiting_notes)
+
+
+async def ask_for_location(user_id: int, lang: str, fulfillment: str, state: FSMContext, send):
+    await state.set_state(OrderFlow.awaiting_location)
+    prompt_key = "share_location_delivery_prompt" if fulfillment == "delivery" else "share_location_prompt"
+    location_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    sent = await send(t(lang, prompt_key), reply_markup=location_kb)
+    track_checkout_message(user_id, sent.message_id)
 
 
 @router.callback_query(F.data.startswith("fulfillment:"))
@@ -495,16 +617,32 @@ async def fulfillment_chosen(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     fulfillment = callback.data.split(":", 1)[1]
     await state.update_data(fulfillment=fulfillment)
-    await state.set_state(OrderFlow.awaiting_location)
 
-    prompt_key = "share_location_delivery_prompt" if fulfillment == "delivery" else "share_location_prompt"
-    location_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    sent = await callback.message.answer(t(lang, prompt_key), reply_markup=location_kb)
-    track_checkout_message(callback.from_user.id, sent.message_id)
+    if fulfillment == "pickup":
+        home_branch = db.get_home_branch(callback.from_user.id)
+        if home_branch:
+            # already know their nearest branch from onboarding/a past order — skip
+            # asking for location again, but let them switch if they're elsewhere today
+            await state.update_data(branch_name=home_branch["name"])
+            change_kb = InlineKeyboardBuilder()
+            change_kb.button(text=t(lang, "change_branch_button"), callback_data="changebranch")
+            sent = await callback.message.answer(
+                t(lang, "nearest_branch", branch=home_branch["name"], address=home_branch["address"]),
+                reply_markup=change_kb.as_markup(),
+            )
+            track_checkout_message(callback.from_user.id, sent.message_id)
+            await ask_notes(callback.from_user.id, lang, state, send=callback.message.answer)
+            await callback.answer()
+            return
+
+    await ask_for_location(callback.from_user.id, lang, fulfillment, state, send=callback.message.answer)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "changebranch")
+async def change_branch(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    await ask_for_location(callback.from_user.id, lang, "pickup", state, send=callback.message.answer)
     await callback.answer()
 
 
@@ -533,17 +671,13 @@ async def location_received(message: Message, state: FSMContext):
     else:
         branch = branches.nearest_branch(lat, lng)
         await state.update_data(branch_name=branch["name"])
+        db.save_home_branch(message.from_user.id, branch["name"], lat, lng)  # keep their saved branch fresh
         sent1 = await message.answer(
             t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
             reply_markup=ReplyKeyboardRemove(),
         )
     track_checkout_message(message.from_user.id, sent1.message_id)
-
-    skip_kb = InlineKeyboardBuilder()
-    skip_kb.button(text=t(lang, "skip_notes_button"), callback_data="skipnotes")
-    sent2 = await message.answer(t(lang, "ask_notes"), reply_markup=skip_kb.as_markup())
-    track_checkout_message(message.from_user.id, sent2.message_id)
-    await state.set_state(OrderFlow.awaiting_notes)
+    await ask_notes(message.from_user.id, lang, state, send=message.answer)
 
 
 @router.message(OrderFlow.awaiting_notes)
@@ -948,6 +1082,99 @@ def is_staff(callback: CallbackQuery) -> bool:
 
 def is_staff_message(message: Message) -> bool:
     return is_order_staff(message.chat.id)
+
+
+@router.message(Command("queue"))
+async def queue_command(message: Message):
+    """Lists every unclaimed/in-progress order in one place, so staff don't have
+    to scroll back through the group chat to see what's still open."""
+    if not is_staff_message(message):
+        return
+    lang = lang_of(message.from_user.id)
+    open_orders = db.get_open_orders()
+    if not open_orders:
+        await message.answer(t(lang, "queue_empty"))
+        return
+
+    lines = [t(lang, "queue_header")]
+    for o in open_orders:
+        icon = "🔵" if o["prep_status"] == "preparing" else "🟡"
+        claimed = f" ({o['claimed_by_name']})" if o["claimed_by_name"] else ""
+        branch = f" · {o['branch_name']}" if o["branch_name"] else ""
+        pickup = f" · {o['pickup_time']}" if o["pickup_time"] else ""
+        lines.append(
+            f"{icon} #{o['order_number']}{claimed}{branch}{pickup}\n{o['items_summary'] or '—'}"
+        )
+    await message.answer("\n\n".join(lines))
+
+
+# ---------- staff stock toggle — lets anyone in the staff group mark an item
+# in/out of stock without going through owner-only /admin ----------
+
+async def render_stock_list(callback: CallbackQuery, category_id: int):
+    lang = lang_of(callback.from_user.id)
+    items = menu_store.list_items(category_id)
+    kb = InlineKeyboardBuilder()
+    for item in items:
+        name = item["name"].get(lang, item["name"]["en"])
+        icon = "✅" if item["in_stock"] else "🚫"
+        kb.button(text=f"{icon} {name}", callback_data=f"stocktoggle:{item['id']}:{category_id}")
+    kb.adjust(1)
+    kb.button(text=t(lang, "back_button"), callback_data="stockback")
+    kb.adjust(*([1] * len(items)), 1)
+    await callback.message.edit_text(t(lang, "stock_tap_to_toggle"), reply_markup=kb.as_markup())
+
+
+@router.message(Command("stock"))
+async def stock_command(message: Message):
+    if not is_staff_message(message):
+        return
+    lang = lang_of(message.from_user.id)
+    categories = menu_store.list_categories()
+    if not categories:
+        await message.answer(t(lang, "menu_currently_empty"))
+        return
+    kb = InlineKeyboardBuilder()
+    for cat in categories:
+        kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"stockcat:{cat['id']}")
+    kb.adjust(2)
+    await message.answer(t(lang, "stock_choose_category"), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("stockcat:"))
+async def stock_category_chosen(callback: CallbackQuery):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    category_id = int(callback.data.split(":")[1])
+    await render_stock_list(callback, category_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("stocktoggle:"))
+async def stock_item_toggled(callback: CallbackQuery):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    _, item_id_str, category_id_str = callback.data.split(":")
+    menu_store.toggle_item_stock(int(item_id_str))
+    await render_stock_list(callback, int(category_id_str))
+    await callback.answer(t(lang_of(callback.from_user.id), "stock_updated"))
+
+
+@router.callback_query(F.data == "stockback")
+async def stock_back(callback: CallbackQuery):
+    if not is_staff(callback):
+        await callback.answer()
+        return
+    lang = lang_of(callback.from_user.id)
+    categories = menu_store.list_categories()
+    kb = InlineKeyboardBuilder()
+    for cat in categories:
+        kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"stockcat:{cat['id']}")
+    kb.adjust(2)
+    await callback.message.edit_text(t(lang, "stock_choose_category"), reply_markup=kb.as_markup())
+    await callback.answer()
 
 
 @router.message(Command("testgroup"))
