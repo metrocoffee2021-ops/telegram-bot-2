@@ -409,6 +409,10 @@ async def cleanup_checkout_messages(bot, user_id: int):
 async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_you_text: str):
     await cleanup_checkout_messages(bot, user_id)
     await bot.send_message(user_id, thank_you_text, reply_markup=main_menu_keyboard(lang))
+    # the contact/location prompts during checkout replace Telegram's custom keyboard
+    # with their own one-time ones, which then just vanish — this brings the
+    # persistent Menu/Cart/Card/Orders bar back so there's always a way to start again
+    await bot.send_message(user_id, t(lang, "shortcuts_ready"), reply_markup=persistent_keyboard(lang))
 
     categories = menu_store.list_categories()
     if categories:
@@ -1335,6 +1339,9 @@ async def rate_order(callback: CallbackQuery):
         return
     db.save_order_rating(order_id, int(stars))
     await callback.message.edit_text(t(lang, "rating_thanks", stars="⭐" * int(stars)))
+    # this was the dead end customers were getting stuck at — nothing told them
+    # how to start another order, so close the loop explicitly right here
+    await callback.message.answer(t(lang, "ready_for_next_order"), reply_markup=persistent_keyboard(lang))
     await callback.answer()
 
 
