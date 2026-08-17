@@ -193,13 +193,46 @@ async def show_category(user_id: int, cat_id: int, send):
         kb.button(text=name, callback_data=f"admitem:{item['id']}")
     kb.button(text=t(lang, "admin_add_item_button"), callback_data=f"admadditem:{cat_id}")
     kb.button(text=t(lang, "admin_rename_button"), callback_data=f"admrenamecat:{cat_id}")
+    kb.button(text=t(lang, "admin_edit_emoji_button"), callback_data=f"admemoji:{cat_id}")
     kb.button(text=t(lang, "admin_delete_category_button"), callback_data=f"admdelcat:{cat_id}")
     kb.button(text=t(lang, "admin_back_button"), callback_data="admin_categories")
-    kb.adjust(*([1] * len(items)), 1, 1, 1, 1)
+    kb.adjust(*([1] * len(items)), 1, 1, 1, 1, 1)
 
-    header = category["name"].get(lang, category["name"]["en"]) if category else ""
+    emoji = category["emoji"] if category else ""
+    header = f"{emoji} {category['name'].get(lang, category['name']['en'])}" if category else ""
     body = header if items else header + "\n" + t(lang, "admin_no_items")
     await send(body, reply_markup=kb.as_markup())
+
+
+class EmojiFlow(StatesGroup):
+    awaiting_emoji = State()
+
+
+@router.callback_query(F.data.startswith("admemoji:"))
+async def edit_emoji_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    cat_id = int(callback.data.split(":")[1])
+    lang = lang_of(callback.from_user.id)
+    await state.set_data({"cat_id": cat_id})
+    await state.set_state(EmojiFlow.awaiting_emoji)
+    await callback.message.answer(t(lang, "admin_send_emoji"))
+    await callback.answer()
+
+
+@router.message(EmojiFlow.awaiting_emoji)
+async def edit_emoji_received(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if not message.text:
+        return
+    lang = lang_of(message.from_user.id)
+    data = await state.get_data()
+    emoji = message.text.strip()[:8]  # a stray long paste shouldn't break the category button label
+    menu_store.set_category_emoji(data["cat_id"], emoji)
+    await state.clear()
+    await message.answer(t(lang, "admin_emoji_updated"))
+    await show_category(message.from_user.id, data["cat_id"], message.answer)
 
 
 # ---------- delete category ----------
@@ -392,10 +425,12 @@ async def show_item(user_id: int, item_id: int, send):
     name = item["name"].get(lang, item["name"]["en"])
     topping_state = t(lang, "admin_topping_on") if item["has_topping_option"] else t(lang, "admin_topping_off")
     stock_state = t(lang, "admin_stock_in") if item["in_stock"] else t(lang, "admin_stock_out")
+    photo_state = t(lang, "admin_photo_yes") if item.get("photo_file_id") else t(lang, "admin_photo_none")
     header = (
         f"{t(lang, 'admin_item_header')} {name}\n\n"
         f"{t(lang, 'admin_topping_label')} {topping_state}\n"
         f"{t(lang, 'admin_stock_label')} {stock_state}\n"
+        f"{t(lang, 'admin_photo_label')} {photo_state}\n"
         f"{t(lang, 'admin_description_label')} {item['description'] or t(lang, 'admin_description_none')}"
     )
 
@@ -405,8 +440,9 @@ async def show_item(user_id: int, item_id: int, send):
         kb.button(text=label, callback_data=f"admeditprice:{v['id']}")
     kb.button(text=t(lang, "admin_rename_button"), callback_data=f"admrenameitem:{item_id}")
     kb.button(text=t(lang, "admin_edit_description_button"), callback_data=f"admeditdesc:{item_id}")
+    kb.button(text=t(lang, "admin_edit_photo_button"), callback_data=f"admphoto:{item_id}")
     kb.button(text=t(lang, "admin_add_option_button"), callback_data=f"admaddoption:{item_id}")
-    trailing_rows = 7
+    trailing_rows = 8
     if item["variants"]:
         kb.button(text=t(lang, "admin_remove_option_button"), callback_data=f"admremoveopt:{item_id}")
         trailing_rows += 1
@@ -417,6 +453,49 @@ async def show_item(user_id: int, item_id: int, send):
     kb.adjust(*([1] * len(item["variants"])), *([1] * trailing_rows))
 
     await send(header, reply_markup=kb.as_markup())
+
+
+class PhotoFlow(StatesGroup):
+    awaiting_photo = State()
+
+
+@router.callback_query(F.data.startswith("admphoto:"))
+async def edit_photo_start(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    item_id = int(callback.data.split(":")[1])
+    lang = lang_of(callback.from_user.id)
+    await state.set_data({"item_id": item_id})
+    await state.set_state(PhotoFlow.awaiting_photo)
+    await callback.message.answer(t(lang, "admin_send_photo"))
+    await callback.answer()
+
+
+@router.message(PhotoFlow.awaiting_photo, F.photo)
+async def edit_photo_received(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    lang = lang_of(message.from_user.id)
+    data = await state.get_data()
+    # [-1] is Telegram's largest available resolution for this upload
+    menu_store.set_item_photo(data["item_id"], message.photo[-1].file_id)
+    await state.clear()
+    await message.answer(t(lang, "admin_photo_updated"))
+    await show_item(message.from_user.id, data["item_id"], message.answer)
+
+
+@router.message(PhotoFlow.awaiting_photo)
+async def edit_photo_text_received(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if not message.text or message.text.strip().lower() not in {"skip", "o'chirish", "olib tashlash", "-"}:
+        return
+    lang = lang_of(message.from_user.id)
+    data = await state.get_data()
+    menu_store.set_item_photo(data["item_id"], None)
+    await state.clear()
+    await message.answer(t(lang, "admin_photo_removed"))
+    await show_item(message.from_user.id, data["item_id"], message.answer)
 
 
 class DescFlow(StatesGroup):

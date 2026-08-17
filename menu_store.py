@@ -50,6 +50,44 @@ def init_menu_tables():
         )""")
         db._add_column_if_missing(conn, "items", "in_stock", "INTEGER DEFAULT 1")
         db._add_column_if_missing(conn, "items", "description", "TEXT")
+        db._add_column_if_missing(conn, "items", "photo_file_id", "TEXT")
+        db._add_column_if_missing(conn, "categories", "emoji", "TEXT")
+    _backfill_category_emojis()
+
+
+_EMOJI_GUESS = [
+    (("coffee", "qahva", "kofe", "кофе", "espresso", "latte", "americano"), "☕"),
+    (("matcha", "матча"), "🍵"),
+    (("tea", "choy", "чай"), "🍵"),
+    (("soda", "сода", "lemonade", "limonad"), "🥤"),
+    (("juice", "sharbat", "сок"), "🧃"),
+    (("dessert", "shirinlik", "cake", "tort", "десерт"), "🍰"),
+    (("bubble", "boba", "bambl"), "🧋"),
+]
+
+
+def _guess_emoji(name_uz: str, name_ru: str, name_en: str) -> str:
+    combined = f"{name_uz} {name_ru} {name_en}".lower()
+    for keywords, emoji in _EMOJI_GUESS:
+        if any(k in combined for k in keywords):
+            return emoji
+    return "☕"
+
+
+def _backfill_category_emojis():
+    """Fills in a sensible emoji for any category that doesn't have one yet —
+    covers both brand-new categories the owner adds later and categories that
+    already existed before this feature was added. Safe to call on every
+    startup; only touches rows that are still missing an emoji."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, name_uz, name_ru, name_en FROM categories WHERE emoji IS NULL OR emoji = ''"
+        ).fetchall()
+        for cat_id, name_uz, name_ru, name_en in rows:
+            conn.execute(
+                "UPDATE categories SET emoji = ? WHERE id = ?",
+                (_guess_emoji(name_uz, name_ru, name_en), cat_id),
+            )
 
 
 def seed_if_empty():
@@ -61,10 +99,10 @@ def seed_if_empty():
             return
 
         category_ids = {}
-        for position, (cat_key, name_uz, name_ru, name_en) in enumerate(SEED_CATEGORIES):
+        for position, (cat_key, name_uz, name_ru, name_en, emoji) in enumerate(SEED_CATEGORIES):
             cur = conn.execute(
-                "INSERT INTO categories (name_uz, name_ru, name_en, position) VALUES (?, ?, ?, ?)",
-                (name_uz, name_ru, name_en, position),
+                "INSERT INTO categories (name_uz, name_ru, name_en, position, emoji) VALUES (?, ?, ?, ?, ?)",
+                (name_uz, name_ru, name_en, position, emoji),
             )
             category_ids[cat_key] = cur.lastrowid
 
@@ -91,23 +129,24 @@ def _row_to_names(row_prefix_vals):
 def list_categories() -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, name_uz, name_ru, name_en FROM categories ORDER BY position, id"
+            "SELECT id, name_uz, name_ru, name_en, emoji FROM categories ORDER BY position, id"
         ).fetchall()
-    return [{"id": r[0], "name": _row_to_names(r[1:4])} for r in rows]
+    return [{"id": r[0], "name": _row_to_names(r[1:4]), "emoji": r[4] or "☕"} for r in rows]
 
 
 def get_category(category_id: int) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, name_uz, name_ru, name_en FROM categories WHERE id = ?", (category_id,)
+            "SELECT id, name_uz, name_ru, name_en, emoji FROM categories WHERE id = ?", (category_id,)
         ).fetchone()
-    return {"id": row[0], "name": _row_to_names(row[1:4])} if row else None
+    return {"id": row[0], "name": _row_to_names(row[1:4]), "emoji": row[4] or "☕"} if row else None
 
 
 def list_items(category_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, name_uz, name_ru, name_en, has_topping_option, in_stock, description FROM items WHERE category_id = ? ORDER BY id",
+            "SELECT id, name_uz, name_ru, name_en, has_topping_option, in_stock, description, photo_file_id "
+            "FROM items WHERE category_id = ? ORDER BY id",
             (category_id,),
         ).fetchall()
         items = []
@@ -121,6 +160,7 @@ def list_items(category_id: int) -> list[dict]:
                 "has_topping_option": bool(r[4]),
                 "in_stock": bool(r[5]) if r[5] is not None else True,
                 "description": r[6],
+                "photo_file_id": r[7],
                 "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
             })
     return items
@@ -129,7 +169,8 @@ def list_items(category_id: int) -> list[dict]:
 def get_item(item_id: int) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT id, category_id, name_uz, name_ru, name_en, has_topping_option, in_stock, description FROM items WHERE id = ?",
+            "SELECT id, category_id, name_uz, name_ru, name_en, has_topping_option, in_stock, description, "
+            "photo_file_id FROM items WHERE id = ?",
             (item_id,),
         ).fetchone()
         if not row:
@@ -144,6 +185,7 @@ def get_item(item_id: int) -> dict | None:
         "has_topping_option": bool(row[5]),
         "in_stock": bool(row[6]) if row[6] is not None else True,
         "description": row[7],
+        "photo_file_id": row[8],
         "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
     }
 
@@ -181,6 +223,16 @@ def update_category_names(category_id: int, name_uz: str, name_ru: str, name_en:
             "UPDATE categories SET name_uz = ?, name_ru = ?, name_en = ? WHERE id = ?",
             (name_uz, name_ru, name_en, category_id),
         )
+
+
+def set_category_emoji(category_id: int, emoji: str):
+    with get_db() as conn:
+        conn.execute("UPDATE categories SET emoji = ? WHERE id = ?", (emoji, category_id))
+
+
+def set_item_photo(item_id: int, photo_file_id: str | None):
+    with get_db() as conn:
+        conn.execute("UPDATE items SET photo_file_id = ? WHERE id = ?", (photo_file_id, item_id))
 
 
 def update_item_names(item_id: int, name_uz: str, name_ru: str, name_en: str):

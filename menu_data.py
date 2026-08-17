@@ -6,10 +6,10 @@
 # has no effect, since the real menu lives in metropia.db from then on.
 
 SEED_CATEGORIES = [
-    # (category_id, name_uz, name_ru, name_en)
-    ("qahvalar", "Qahvalar", "Кофе", "Coffee"),
-    ("matcha", "Matcha", "Матча", "Matcha"),
-    ("soda", "Soda", "Сода", "Soda"),
+    # (category_id, name_uz, name_ru, name_en, emoji)
+    ("qahvalar", "Qahvalar", "Кофе", "Coffee", "☕"),
+    ("matcha", "Matcha", "Матча", "Matcha", "🍵"),
+    ("soda", "Soda", "Сода", "Soda", "🥤"),
 ]
 
 # Each item: (category_id, item_key, name_uz, name_ru, name_en, has_topping_option, variants)

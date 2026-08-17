@@ -8,6 +8,7 @@
 import os
 import time
 import json
+import html
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -95,24 +96,35 @@ def lang_of(user_id: int) -> str:
     return db.get_user_language(user_id)
 
 
-async def respond(target, text: str, reply_markup=None):
+async def respond(target, text: str, reply_markup=None, parse_mode: str | None = None):
     """Use this instead of message.answer()/callback.message.answer() for every
     step in the ordering flow. When the step was reached by tapping a button,
     this EDITS that same message in place instead of sending a new one — so
     browsing the menu doesn't flood the chat with dozens of old messages.
     When reached via a typed command (no previous bot message to edit), it
     just sends normally. Returns the resulting message, so callers can track
-    it with track_checkout_message() if it needs cleaning up later."""
+    it with track_checkout_message() if it needs cleaning up later.
+
+    parse_mode is opt-in per call (not a bot-wide default) — several admin/
+    staff messages contain literal '<' '>' characters (e.g. "/cash <amount>")
+    that would break HTML parsing if it were on everywhere."""
     if isinstance(target, CallbackQuery):
         try:
-            return await target.message.edit_text(text, reply_markup=reply_markup)
+            return await target.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception:
             # message has no editable text (e.g. was a photo), or content is
             # byte-for-byte identical to what's already shown — either way,
             # falling back to a fresh message is always safe.
-            return await target.message.answer(text, reply_markup=reply_markup)
+            return await target.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
     else:
-        return await target.answer(text, reply_markup=reply_markup)
+        return await target.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
+def esc(value) -> str:
+    """Escapes user- or owner-entered text before it goes into an HTML-formatted
+    (parse_mode='HTML') message, so a stray '<', '>', or '&' in an item name,
+    description, or order note can never break message formatting."""
+    return html.escape(str(value or ""), quote=False)
 
 
 def add_nav_row(kb: InlineKeyboardBuilder, lang: str, back_callback: str):
@@ -243,14 +255,15 @@ async def show_categories(target):
         return
     kb = InlineKeyboardBuilder()
     for cat in categories:
-        kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
+        name = cat["name"].get(lang, cat["name"]["en"])
+        kb.button(text=f"{cat['emoji']} {name}", callback_data=f"cat:{cat['id']}")
     kb.adjust(2)
-    header = t(lang, "choose_category")
+    header = f"<b>{esc(t(lang, 'choose_category'))}</b>"
     cart = CART.get(user_id, [])
     if cart:
         qty = sum(entry.get("qty", 1) for entry in cart)
         header += "\n" + t(lang, "cart_summary_line", qty=qty, total=fmt_price(cart_total(user_id)))
-    await respond(target, header, reply_markup=kb.as_markup())
+    await respond(target, header, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("cat:"))
@@ -268,8 +281,11 @@ async def show_items(callback: CallbackQuery):
             kb.button(text=f"❌ {name} — {t(lang, 'out_of_stock')}", callback_data="outofstock")
     kb.button(text=t(lang, "back_button"), callback_data="menu")
     kb.adjust(*([1] * len(items)), 1)
-    header = category["name"].get(lang, category["name"]["en"]) if category else ""
-    await respond(callback, header, reply_markup=kb.as_markup())
+    if category:
+        header = f"<b>{category['emoji']} {esc(category['name'].get(lang, category['name']['en']))}</b>"
+    else:
+        header = ""
+    await respond(callback, header, reply_markup=kb.as_markup(), parse_mode="HTML")
     await callback.answer()
 
 
@@ -287,6 +303,17 @@ async def choose_temp_or_size(callback: CallbackQuery):
     if not item:
         await callback.answer()
         return
+
+    name = item["name"].get(lang, item["name"]["en"])
+    has_photo = bool(item.get("photo_file_id"))
+    if has_photo:
+        caption = f"<b>{esc(name)}</b>"
+        if item.get("description"):
+            caption += f"\n{esc(item['description'])}"
+        await callback.bot.send_photo(
+            callback.from_user.id, item["photo_file_id"], caption=caption, parse_mode="HTML"
+        )
+
     temps = temps_for(item)
 
     if len(temps) > 1:
@@ -299,7 +326,8 @@ async def choose_temp_or_size(callback: CallbackQuery):
     else:
         await ask_size_or_add(callback, item_id, temps[0])
 
-    if item.get("description"):
+    # if we already showed the description in the photo caption, no need to repeat it in a popup
+    if item.get("description") and not has_photo:
         await callback.answer(item["description"], show_alert=True)
     else:
         await callback.answer()
@@ -410,7 +438,7 @@ async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_yo
     await cleanup_checkout_messages(bot, user_id)
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "new_order_button"), callback_data="menu")
-    await bot.send_message(user_id, thank_you_text, reply_markup=kb.as_markup())
+    await bot.send_message(user_id, thank_you_text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
 
@@ -420,11 +448,29 @@ def cart_total(user_id: int) -> int:
 
 
 def cart_lines(cart: list[dict]) -> list[str]:
+    """Plain-text lines — used for items_summary stored in the DB and shown in
+    staff tools (/queue, tickets, /myorders) which aren't HTML-parsed. For the
+    customer-facing cart screens themselves, use cart_lines_html() instead."""
     lines = []
     for entry in cart:
         parts = [entry["name"]]
         if entry["size"]:
             parts.append(entry["size"])
+        if entry["topping"]:
+            parts.append("+ boba")
+        qty_suffix = f" x{entry['qty']}" if entry["qty"] > 1 else ""
+        lines.append("• " + " ".join(parts) + qty_suffix)
+    return lines
+
+
+def cart_lines_html(cart: list[dict]) -> list[str]:
+    """Same as cart_lines(), but with the item name bolded and escaped for
+    display on the live cart screens (sent with parse_mode='HTML')."""
+    lines = []
+    for entry in cart:
+        parts = [f"<b>{esc(entry['name'])}</b>"]
+        if entry["size"]:
+            parts.append(esc(entry["size"]))
         if entry["topping"]:
             parts.append("+ boba")
         qty_suffix = f" x{entry['qty']}" if entry["qty"] > 1 else ""
@@ -461,7 +507,11 @@ async def show_cart_editable(target):
         await respond(target, t(lang, "cart_empty"), reply_markup=kb.as_markup())
         return
 
-    text = t(lang, "your_order") + "\n" + "\n".join(cart_lines(cart)) + f"\n\n{t(lang, 'total')}: {fmt_price(cart_total(user_id))} so'm"
+    text = (
+        f"<b>{esc(t(lang, 'your_order'))}</b>\n"
+        + "\n".join(cart_lines_html(cart))
+        + f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(cart_total(user_id))} so'm</b>"
+    )
 
     kb = InlineKeyboardBuilder()
     for i, entry in enumerate(cart):
@@ -474,7 +524,7 @@ async def show_cart_editable(target):
     kb.button(text=t(lang, "menu_button"), callback_data="menu")
     kb.adjust(*([3] * len(cart)), 1, 1, 1)
 
-    await respond(target, text, reply_markup=kb.as_markup())
+    await respond(target, text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("cartinc:"))
@@ -541,7 +591,11 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
         return
 
     total = cart_total(user_id)
-    text = t(lang, "your_order") + "\n" + "\n".join(cart_lines(cart)) + f"\n\n{t(lang, 'total')}: {fmt_price(total)} so'm"
+    text = (
+        f"<b>{esc(t(lang, 'your_order'))}</b>\n"
+        + "\n".join(cart_lines_html(cart))
+        + f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
+    )
     send = target.message.answer if isinstance(target, CallbackQuery) else target.answer
 
     if offer_payment and state is not None:
@@ -552,7 +606,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
             # already have their number from a past order — skip straight to
             # fulfillment instead of asking them to share it again every time
             await state.update_data(phone=saved_phone)
-            sent = await respond(target, text)
+            sent = await respond(target, text, parse_mode="HTML")
             if not isinstance(target, CallbackQuery):
                 track_checkout_message(user_id, sent.message_id)
             await ask_fulfillment(user_id, lang, send=send)
@@ -564,7 +618,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
             resize_keyboard=True,
             one_time_keyboard=True,
         )
-        sent = await respond(target, text)
+        sent = await respond(target, text, parse_mode="HTML")
         if not isinstance(target, CallbackQuery):
             track_checkout_message(user_id, sent.message_id)
         # A ReplyKeyboardMarkup can't be attached to an edited message in Telegram —
@@ -572,7 +626,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
         contact_msg = await send(t(lang, "share_contact_prompt"), reply_markup=contact_kb)
         track_checkout_message(user_id, contact_msg.message_id)
     else:
-        await respond(target, text)
+        await respond(target, text, parse_mode="HTML")
 
 
 async def ask_fulfillment(user_id: int, lang: str, send):
@@ -852,7 +906,7 @@ async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_sn
     reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
     order = db.get_order(order_id)
     if order["branch_name"]:
-        reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
+        reply += "\n" + t(lang, "pickup_reminder", branch=esc(order["branch_name"]))
     if result["earned_free_item"]:
         reply += "\n" + t(lang, "free_coffee_ready")
     remaining = db.get_bundle_credits(callback.from_user.id)
@@ -906,7 +960,7 @@ async def cash_checkout_confirm(callback: CallbackQuery):
     try:
         notice = t(customer_lang, "order_complete_thanks") + "\n" + t(customer_lang, "cash_order_confirmed_customer", number=ticket_number)
         if order["branch_name"]:
-            notice += "\n" + t(customer_lang, "pickup_reminder", branch=order["branch_name"])
+            notice += "\n" + t(customer_lang, "pickup_reminder", branch=esc(order["branch_name"]))
         if result["earned_free_item"]:
             notice += "\n" + t(customer_lang, "free_coffee_ready")
         elif result["card_expired"]:
@@ -996,7 +1050,7 @@ async def handle_successful_payment(message: Message):
     order = db.get_order(order_id)
     reply = t(lang, "order_complete_thanks") + "\n" + t(lang, "payment_success", number=ticket_number)
     if order and order["branch_name"]:
-        reply += "\n" + t(lang, "pickup_reminder", branch=order["branch_name"])
+        reply += "\n" + t(lang, "pickup_reminder", branch=esc(order["branch_name"]))
     if result["card_expired"]:
         reply += "\n" + t(lang, "card_expired_notice")
     if result["earned_free_item"]:
