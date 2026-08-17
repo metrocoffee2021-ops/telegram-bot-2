@@ -408,19 +408,9 @@ async def cleanup_checkout_messages(bot, user_id: int):
 
 async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_you_text: str):
     await cleanup_checkout_messages(bot, user_id)
-    await bot.send_message(user_id, thank_you_text, reply_markup=main_menu_keyboard(lang))
-    # the contact/location prompts during checkout replace Telegram's custom keyboard
-    # with their own one-time ones, which then just vanish — this brings the
-    # persistent Menu/Cart/Card/Orders bar back so there's always a way to start again
-    await bot.send_message(user_id, t(lang, "shortcuts_ready"), reply_markup=persistent_keyboard(lang))
-
-    categories = menu_store.list_categories()
-    if categories:
-        kb = InlineKeyboardBuilder()
-        for cat in categories:
-            kb.button(text=cat["name"].get(lang, cat["name"]["en"]), callback_data=f"cat:{cat['id']}")
-        kb.adjust(2)
-        await bot.send_message(user_id, t(lang, "choose_category"), reply_markup=kb.as_markup())
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "new_order_button"), callback_data="menu")
+    await bot.send_message(user_id, thank_you_text, reply_markup=kb.as_markup())
 
 
 
@@ -1338,10 +1328,9 @@ async def rate_order(callback: CallbackQuery):
         await callback.answer()
         return
     db.save_order_rating(order_id, int(stars))
-    await callback.message.edit_text(t(lang, "rating_thanks", stars="⭐" * int(stars)))
-    # this was the dead end customers were getting stuck at — nothing told them
-    # how to start another order, so close the loop explicitly right here
-    await callback.message.answer(t(lang, "ready_for_next_order"), reply_markup=persistent_keyboard(lang))
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "new_order_button"), callback_data="menu")
+    await callback.message.edit_text(t(lang, "rating_thanks", stars="⭐" * int(stars)), reply_markup=kb.as_markup())
     await callback.answer()
 
 
