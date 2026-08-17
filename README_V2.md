@@ -47,3 +47,17 @@ Create a promotion in Manager, activate it, then a customer can enter `/promo CO
 
 ## Important
 The web dashboard discussed earlier is not included in this package because the Telegram Manager is the current production control surface. Do not expose an unauthenticated web dashboard publicly.
+
+## SIMPLIFIED CUSTOMER CHECKOUT
+
+The customer side is intentionally short:
+
+1. Open bot → **Order**
+2. Choose category → product → options → **Add**
+3. Open **Cart** → **Checkout**
+4. Returning customer: saved phone + saved branch are reused automatically.
+5. Pickup is the default and is **ASAP** by default.
+6. Customer goes directly to one payment screen: Click / Payme / Cash.
+7. Delivery is optional and only asks for a location when selected.
+
+The bot no longer asks the customer to type their name, write notes, or choose a pickup time during normal checkout. Telegram's profile name is saved automatically, the phone is requested once, and branch selection is remembered.

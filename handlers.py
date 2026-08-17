@@ -150,10 +150,13 @@ def add_nav_row(kb: InlineKeyboardBuilder, lang: str, back_callback: str):
 
 
 def main_menu_keyboard(lang: str):
+    # Keep the customer home screen intentionally small: Order, Cart, Rewards, Orders.
     kb = InlineKeyboardBuilder()
-    kb.button(text=t(lang, "menu_button"), callback_data="menu")
-    kb.button(text=t(lang, "stamps_button"), callback_data="stamps")
-    kb.adjust(2)
+    kb.button(text="☕ " + t(lang, "menu_button"), callback_data="menu")
+    kb.button(text="🛒 " + t(lang, "cart_button"), callback_data="cart")
+    kb.button(text="🎁 " + t(lang, "stamps_button"), callback_data="stamps")
+    kb.button(text="🧾 " + t(lang, "my_orders_button"), callback_data="myorders")
+    kb.adjust(2, 2)
     return kb.as_markup()
 
 
@@ -601,14 +604,8 @@ async def checkout_callback(callback: CallbackQuery, state: FSMContext):
         return
     CHECKOUT_MESSAGES[callback.from_user.id] = [callback.message.message_id]
 
-    if not db.is_onboarded(callback.from_user.id):
-        # first-ever checkout for this customer — ask their name once, right here,
-        # instead of making them answer it before they could even see the menu
-        await state.set_state(OnboardingFlow.awaiting_name)
-        sent = await callback.message.answer(t(lang, "onboarding_ask_name"))
-        track_checkout_message(callback.from_user.id, sent.message_id)
-        await callback.answer()
-        return
+    if not db.get_full_name(callback.from_user.id):
+        db.save_full_name(callback.from_user.id, callback.from_user.full_name or "Customer")
 
     await show_cart(callback, offer_payment=True, state=state)
     await callback.answer()
@@ -660,13 +657,11 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
 
         saved_phone = db.get_phone(user_id)
         if saved_phone:
-            # already have their number from a past order — skip straight to
-            # fulfillment instead of asking them to share it again every time
             await state.update_data(phone=saved_phone)
             sent = await respond(target, text, parse_mode="HTML")
             if not isinstance(target, CallbackQuery):
                 track_checkout_message(user_id, sent.message_id)
-            await ask_fulfillment(user_id, lang, send=send)
+            await begin_fast_checkout(user_id, lang, state, send=send)
             return
 
         await state.set_state(OrderFlow.awaiting_contact)
@@ -686,6 +681,79 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
         await respond(target, text, parse_mode="HTML")
 
 
+async def begin_fast_checkout(user_id: int, lang: str, state: FSMContext, send):
+    """Fast customer checkout: pickup is default; no mandatory name, notes or pickup-time steps."""
+    home_branch = db.get_home_branch(user_id)
+    if home_branch:
+        await state.update_data(fulfillment="pickup", branch_name=home_branch["name"], pickup_time="ASAP")
+        await prompt_payment(user_id, lang, state, send=send)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text={"uz":"🏪 Filial tanlash","ru":"🏪 Выбрать филиал","en":"🏪 Choose branch"}[lang], callback_data="choosebranch")
+    kb.button(text={"uz":"🚗 Yetkazib berish","ru":"🚗 Доставка","en":"🚗 Delivery"}[lang], callback_data="fulfillment:delivery")
+    kb.adjust(1)
+    sent = await send({"uz":"Filialni tanlang yoki yetkazib berishni tanlang.","ru":"Выберите филиал или доставку.","en":"Choose a pickup branch or delivery."}[lang], reply_markup=kb.as_markup())
+    track_checkout_message(user_id, sent.message_id)
+
+async def prompt_branch_choice(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    kb = InlineKeyboardBuilder()
+    for i, b in enumerate(branches.all_branches()):
+        kb.button(text="🏪 " + b["name"], callback_data=f"branchset:{i}")
+    kb.adjust(1)
+    await respond(callback, {"uz":"Filialni tanlang:","ru":"Выберите филиал:","en":"Choose your branch:"}[lang], reply_markup=kb.as_markup())
+
+@router.callback_query(F.data == "choosebranch")
+async def choose_branch_fast(callback: CallbackQuery, state: FSMContext):
+    await prompt_branch_choice(callback, state)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("branchset:"))
+async def branch_set_fast(callback: CallbackQuery, state: FSMContext):
+    lang = lang_of(callback.from_user.id)
+    try:
+        index = int(callback.data.split(":", 1)[1])
+        branch = branches.all_branches()[index]
+    except (ValueError, IndexError):
+        branch = None
+    if not branch:
+        await callback.answer({"uz":"Filial topilmadi","ru":"Филиал не найден","en":"Branch not found"}[lang], show_alert=True)
+        return
+    db.save_home_branch(callback.from_user.id, branch["name"], branch.get("lat", 0), branch.get("lng", 0))
+    await state.update_data(fulfillment="pickup", branch_name=branch["name"], pickup_time="ASAP")
+    await prompt_payment(callback.from_user.id, lang, state, send=callback.message.answer)
+    await callback.answer()
+
+async def prompt_payment(user_id: int, lang: str, state: FSMContext, send):
+    data = await state.get_data()
+    subtotal = cart_total(user_id)
+    birthday_item_index = data.get("birthday_item_index")
+    birthday_reward_id = data.get("birthday_reward_id")
+    discount = birthday_discount_for_cart(user_id, birthday_item_index) if birthday_reward_id else 0
+    if not discount and data.get("promo_code"):
+        discount, _ = promotion_discount(user_id, data.get("promo_code"), subtotal)
+    total = subtotal - discount
+    await state.update_data(order_total=total, birthday_discount=discount, pickup_time="ASAP")
+    if data.get("fulfillment") == "delivery":
+        destination = {"uz":"🚗 Yetkazib berish","ru":"🚗 Доставка","en":"🚗 Delivery"}[lang]
+    else:
+        destination = "🏪 " + (data.get("branch_name") or {"uz":"Olib ketish","ru":"Самовывоз","en":"Pickup"}[lang])
+    summary = {"uz":"🧾 Buyurtmani tasdiqlang","ru":"🧾 Подтвердите заказ","en":"🧾 Confirm your order"}[lang]
+    summary += "\n" + destination + "\n" + {"uz":"⚡ Iloji boricha tezroq","ru":"⚡ Как можно скорее","en":"⚡ ASAP"}[lang]
+    if discount:
+        summary += f"\n🎁 -{fmt_price(discount)} so'm"
+    summary += f"\n\n<b>{esc(t(lang, 'total'))}: {fmt_price(total)} so'm</b>"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 Click", callback_data="paymethod:click")
+    kb.button(text="💳 Payme", callback_data="paymethod:payme")
+    kb.button(text=t(lang, "cash_payment_button"), callback_data="paymethod:cash")
+    kb.button(text={"uz":"🎟 Promo","ru":"🎟 Промокод","en":"🎟 Promo code"}[lang], callback_data="promo_enter")
+    kb.button(text={"uz":"🏪 Filial","ru":"🏪 Филиал","en":"🏪 Branch"}[lang], callback_data="choosebranch")
+    kb.button(text={"uz":"🚗 Yetkazib berish","ru":"🚗 Доставка","en":"🚗 Delivery"}[lang], callback_data="fulfillment:delivery")
+    kb.adjust(2, 1, 1, 1)
+    await send(summary, reply_markup=kb.as_markup(), parse_mode="HTML")
+    await state.set_state(OrderFlow.choosing_payment_method)
+
 async def ask_fulfillment(user_id: int, lang: str, send):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "fulfillment_pickup_button"), callback_data="fulfillment:pickup")
@@ -701,8 +769,16 @@ async def contact_received(message: Message, state: FSMContext):
     await state.update_data(phone=message.contact.phone_number)
     db.save_phone(message.from_user.id, message.contact.phone_number)  # remember it for next time
     track_checkout_message(message.from_user.id, message.message_id)  # their "shared contact" bubble
-    await ask_fulfillment(message.from_user.id, lang, send=message.answer)
+    await begin_fast_checkout(message.from_user.id, lang, state, send=message.answer)
 
+
+async def prompt_branch_choice_message(user_id: int, lang: str, state: FSMContext, send):
+    kb = InlineKeyboardBuilder()
+    for i, b in enumerate(branches.all_branches()):
+        kb.button(text="🏪 " + b["name"], callback_data=f"branchset:{i}")
+    kb.adjust(1)
+    sent = await send({"uz":"Filialni tanlang:","ru":"Выберите филиал:","en":"Choose your branch:"}[lang], reply_markup=kb.as_markup())
+    track_checkout_message(user_id, sent.message_id)
 
 async def ask_notes(user_id: int, lang: str, state: FSMContext, send):
     skip_kb = InlineKeyboardBuilder()
@@ -729,32 +805,21 @@ async def fulfillment_chosen(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     fulfillment = callback.data.split(":", 1)[1]
     await state.update_data(fulfillment=fulfillment)
-
     if fulfillment == "pickup":
         home_branch = db.get_home_branch(callback.from_user.id)
         if home_branch:
-            # already know their nearest branch from onboarding/a past order — skip
-            # asking for location again, but let them switch if they're elsewhere today
-            await state.update_data(branch_name=home_branch["name"])
-            change_kb = InlineKeyboardBuilder()
-            change_kb.button(text=t(lang, "change_branch_button"), callback_data="changebranch")
-            sent = await callback.message.answer(
-                t(lang, "nearest_branch", branch=home_branch["name"], address=home_branch["address"]),
-                reply_markup=change_kb.as_markup(),
-            )
-            track_checkout_message(callback.from_user.id, sent.message_id)
-            await ask_notes(callback.from_user.id, lang, state, send=callback.message.answer)
-            await callback.answer()
-            return
-
-    await ask_for_location(callback.from_user.id, lang, fulfillment, state, send=callback.message.answer)
+            await state.update_data(branch_name=home_branch["name"], pickup_time="ASAP")
+            await prompt_payment(callback.from_user.id, lang, state, send=callback.message.answer)
+        else:
+            await prompt_branch_choice(callback, state)
+        await callback.answer()
+        return
+    await ask_for_location(callback.from_user.id, lang, "delivery", state, send=callback.message.answer)
     await callback.answer()
-
 
 @router.callback_query(F.data == "changebranch")
 async def change_branch(callback: CallbackQuery, state: FSMContext):
-    lang = lang_of(callback.from_user.id)
-    await ask_for_location(callback.from_user.id, lang, "pickup", state, send=callback.message.answer)
+    await prompt_branch_choice(callback, state)
     await callback.answer()
 
 
@@ -789,27 +854,26 @@ async def location_received(message: Message, state: FSMContext):
             t(lang, "nearest_branch", branch=branch["name"], address=branch["address"]),
             reply_markup=ReplyKeyboardRemove(),
         )
-    track_checkout_message(message.from_user.id, message.message_id)  # their "shared location" bubble
+    track_checkout_message(message.from_user.id, message.message_id)
     track_checkout_message(message.from_user.id, sent1.message_id)
-    await ask_notes(message.from_user.id, lang, state, send=message.answer)
+    if data.get("fulfillment") == "delivery":
+        await state.update_data(pickup_time="ASAP")
+        await prompt_payment(message.from_user.id, lang, state, send=message.answer)
+    else:
+        await prompt_branch_choice_message(message.from_user.id, lang, state, send=message.answer)
 
 
 @router.message(OrderFlow.awaiting_notes)
 async def notes_received(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
-    text = (message.text or "").strip()
-    if text and text.lower() not in {"skip", "o'tkazib yuborish", "пропустить", "-"}:
-        await state.update_data(notes=text)
-    track_checkout_message(message.from_user.id, message.message_id)  # their typed note (or "skip")
-    await prompt_pickup_time(message.bot, message.from_user.id, lang, state, send=message.answer)
-
+    track_checkout_message(message.from_user.id, message.message_id)
+    await prompt_payment(message.from_user.id, lang, state, send=message.answer)
 
 @router.callback_query(F.data == "skipnotes")
 async def skip_notes(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
-    await prompt_pickup_time(callback.bot, callback.from_user.id, lang, state, send=callback.message.answer)
+    await prompt_payment(callback.from_user.id, lang, state, send=callback.message.answer)
     await callback.answer()
-
 
 async def prompt_pickup_time(bot, user_id: int, lang: str, state: FSMContext, send):
     kb = InlineKeyboardBuilder()
@@ -933,12 +997,8 @@ async def promo_received(message: Message, state: FSMContext):
     if not p:
         await message.answer(promo_label(lang,"invalid")); return
     await state.update_data(promo_code=code,promo_discount=discount)
-    await state.set_state(OrderFlow.choosing_payment_method)
-    await show_cart(message, offer_payment=False, state=state)
-    await prompt_pickup_time(message.bot,message.from_user.id,lang,state,send=message.answer) if False else None
-    # The customer returns to the normal checkout flow; the existing payment selector is shown below.
-    kb=InlineKeyboardBuilder(); kb.button(text="Click",callback_data="paymethod:click"); kb.button(text="Payme",callback_data="paymethod:payme"); kb.button(text=t(lang,"cash_payment_button"),callback_data="paymethod:cash"); kb.adjust(2,1)
-    await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)),reply_markup=kb.as_markup())
+    await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)))
+    await prompt_payment(message.from_user.id, lang, state, send=message.answer)
 
 @router.callback_query(F.data.startswith("paymethod:"))
 async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
