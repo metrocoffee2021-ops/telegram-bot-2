@@ -4,7 +4,7 @@
 
 TEXTS = {
     "uz": {
-        "choose_language": "Tilni tanlang / Выберите язык / Choose language:",
+        "choose_language": "Tilni tanlang:",
         "welcome": "Metropia Coffee botiga xush kelibsiz! ☕\nSizning kofe joyingiz...",
         "menu_button": "📋 Menyu",
         "back_button": "⬅️ Orqaga",

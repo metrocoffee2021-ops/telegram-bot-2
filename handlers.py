@@ -24,6 +24,7 @@ from menu_data import EXTRA_TOPPING_PRICE
 import menu_store
 import db
 import branches
+import metropia_v2
 
 router = Router()
 
@@ -1331,6 +1332,7 @@ async def claim_order(callback: CallbackQuery):
         return
 
     order = db.get_order(order_id)
+    metropia_v2.event(order_id, "preparing", staff_name, "Order claimed")
     customer_label = order_customer_label(order)
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Mark ready", callback_data=f"markready:{order_id}")
@@ -1354,6 +1356,7 @@ async def mark_order_ready(callback: CallbackQuery):
 
     db.mark_order_ready_notified(order_id)
     db.mark_order_prep_ready(order_id)
+    metropia_v2.event(order_id, "ready", callback.from_user.full_name, "Order marked ready")
     customer_lang = lang_of(order["user_id"])
     try:
         rating_kb = InlineKeyboardBuilder()

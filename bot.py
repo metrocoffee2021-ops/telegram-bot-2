@@ -14,6 +14,9 @@ from dotenv import load_dotenv
 
 import db
 import menu_store
+import metropia_v2
+from manager import router as manager_router
+from web_dashboard import start_dashboard
 from handlers import router as customer_router, fmt_price
 from admin import router as admin_router, _aggregate, _format_report
 from texts import t
@@ -80,10 +83,14 @@ async def main():
     db.init_db()
     menu_store.init_menu_tables()
     menu_store.seed_if_empty()
+    metropia_v2.init_v2()
+    metropia_v2.seed_branches()
+    start_dashboard()
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
+    dp.include_router(manager_router)
     dp.include_router(customer_router)
 
     owner_id = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
