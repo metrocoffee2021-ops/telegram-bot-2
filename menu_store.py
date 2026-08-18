@@ -51,9 +51,11 @@ def init_menu_tables():
         db._add_column_if_missing(conn, "items", "in_stock", "INTEGER DEFAULT 1")
         db._add_column_if_missing(conn, "items", "description", "TEXT")
         db._add_column_if_missing(conn, "items", "photo_file_id", "TEXT")
+        db._add_column_if_missing(conn, "items", "birthday_eligible", "INTEGER DEFAULT 1")
         db._add_column_if_missing(conn, "items", "created_at", "TEXT")
         db._add_column_if_missing(conn, "categories", "emoji", "TEXT")
     _backfill_category_emojis()
+    _backfill_birthday_eligibility()
 
 
 _EMOJI_GUESS = [
@@ -90,6 +92,18 @@ def _backfill_category_emojis():
                 (_guess_emoji(name_uz, name_ru, name_en), cat_id),
             )
 
+
+def _backfill_birthday_eligibility():
+    """Default birthday eligibility to drinks and explicitly exclude obvious non-drink categories.
+    New items default to eligible; owners can keep dessert/non-drink categories excluded by naming them clearly."""
+    with get_db() as conn:
+        conn.execute("""UPDATE items SET birthday_eligible=0 WHERE category_id IN (
+            SELECT id FROM categories WHERE lower(name_uz||' '||name_ru||' '||name_en) LIKE '%dessert%'
+            OR lower(name_uz||' '||name_ru||' '||name_en) LIKE '%shirinlik%'
+            OR lower(name_uz||' '||name_ru||' '||name_en) LIKE '%cake%'
+            OR lower(name_uz||' '||name_ru||' '||name_en) LIKE '%tort%'
+            OR lower(name_uz||' '||name_ru||' '||name_en) LIKE '%десерт%'
+        )""")
 
 def seed_if_empty():
     """Only runs once — if categories already exist, does nothing, so it's
@@ -147,7 +161,7 @@ def list_items(category_id: int) -> list[dict]:
     with get_db() as conn:
         rows = conn.execute(
             "SELECT id, name_uz, name_ru, name_en, has_topping_option, in_stock, description, photo_file_id, "
-            "created_at FROM items WHERE category_id = ? ORDER BY id",
+            "birthday_eligible, created_at FROM items WHERE category_id = ? ORDER BY id",
             (category_id,),
         ).fetchall()
         items = []
@@ -162,7 +176,8 @@ def list_items(category_id: int) -> list[dict]:
                 "in_stock": bool(r[5]) if r[5] is not None else True,
                 "description": r[6],
                 "photo_file_id": r[7],
-                "created_at": r[8],
+                "birthday_eligible": bool(r[8]) if r[8] is not None else True,
+                "created_at": r[9],
                 "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
             })
     return items
@@ -172,7 +187,7 @@ def get_item(item_id: int) -> dict | None:
     with get_db() as conn:
         row = conn.execute(
             "SELECT id, category_id, name_uz, name_ru, name_en, has_topping_option, in_stock, description, "
-            "photo_file_id, created_at FROM items WHERE id = ?",
+            "photo_file_id, birthday_eligible, created_at FROM items WHERE id = ?",
             (item_id,),
         ).fetchone()
         if not row:
@@ -188,7 +203,8 @@ def get_item(item_id: int) -> dict | None:
         "in_stock": bool(row[6]) if row[6] is not None else True,
         "description": row[7],
         "photo_file_id": row[8],
-        "created_at": row[9],
+        "birthday_eligible": bool(row[9]) if row[9] is not None else True,
+        "created_at": row[10],
         "variants": [{"id": v[0], "temp": v[1], "size": v[2], "price": v[3]} for v in variants],
     }
 

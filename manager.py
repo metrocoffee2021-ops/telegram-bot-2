@@ -21,13 +21,14 @@ def back_kb():
 
 def manager_kb():
     kb=InlineKeyboardBuilder()
-    for text,data in [("🏪 Locations","m:branches"),("🔥 Promotions","m:promos"),("📦 Products","m:products"),("🧾 Orders","m:orders"),("📊 Analytics","m:analytics"),("🎂 Birthday","m:birthday")]: btn(kb,text,data)
+    for text,data in [("🏪 Locations","m:branches"),("🔥 Promotions","m:promos"),("📦 Products","m:products"),("🧾 Orders","m:orders"),("📊 Analytics","m:analytics"),("🎂 Birthday","m:birthday"),("📢 Broadcast","m:broadcast")]: btn(kb,text,data)
     kb.adjust(2); return kb.as_markup()
 
 class MFlow(StatesGroup):
     branch_name=State(); branch_address=State(); branch_lat=State(); branch_lng=State(); branch_phone=State(); branch_hours=State(); branch_pickup=State(); branch_delivery=State(); branch_edit_id=State()
-    promo_name=State(); promo_code=State(); promo_type=State(); promo_value=State(); promo_start=State(); promo_end=State(); promo_min=State(); promo_max=State(); promo_edit_id=State()
+    promo_name=State(); promo_code=State(); promo_type=State(); promo_value=State(); promo_start=State(); promo_end=State(); promo_min=State(); promo_max=State(); promo_daily=State(); promo_edit_id=State()
     birthday_percent=State(); birthday_days=State()
+    broadcast_text=State()
 
 @router.message(Command("manager"))
 @router.message(Command("manage"))
@@ -259,11 +260,33 @@ async def pmax_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None; raw=(m.text or '').strip(); v=p['max_uses'] if p and raw.upper()=='SAME' else int(raw or 0) if raw.isdigit() else -1
     if v<0: return await m.answer('Send a whole number.')
+    await state.update_data(max_uses=v); await state.set_state(MFlow.promo_daily)
+    p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None
+    current=f" Current: {p['daily_start']}-{p['daily_end']}." if p and p.get('daily_start') else ''
+    await m.answer("Recurring daily window? e.g. 15:00-17:00 for every-day happy hour, or blank for a normal one-time promo (or SAME)."+current)
+
+def _promo_daily(raw, current_start=None, current_end=None):
+    raw=(raw or '').strip()
+    if raw.upper()=='SAME': return (current_start, current_end)
+    if not raw: return (None, None)
+    try:
+        start_s, end_s = [part.strip() for part in raw.split('-', 1)]
+        datetime.strptime(start_s, '%H:%M'); datetime.strptime(end_s, '%H:%M')
+        return (start_s, end_s)
+    except (ValueError, IndexError):
+        return ('__INVALID__', None)
+
+@router.message(MFlow.promo_daily)
+async def pdaily_set(m:Message,state:FSMContext):
+    if not owner(m.from_user.id): return
+    d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None
+    daily_start, daily_end = _promo_daily(m.text, p['daily_start'] if p else None, p['daily_end'] if p else None)
+    if daily_start=='__INVALID__': return await m.answer("Use HH:MM-HH:MM (e.g. 15:00-17:00) or leave blank.")
     try:
         if 'edit_id' in d:
-            db.update_promotion(d['edit_id'],d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),v); msg='✅ Promotion updated.'
+            db.update_promotion(d['edit_id'],d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),d.get('max_uses',0),daily_start,daily_end); msg='✅ Promotion updated.'
         else:
-            db.add_promotion(d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),v); msg='✅ Promotion created. It is inactive until you activate it.'
+            db.add_promotion(d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),d.get('max_uses',0),daily_start,daily_end); msg='✅ Promotion created. It is inactive until you activate it.'
     except sqlite3.IntegrityError:
         return await m.answer('That promo code already exists. Choose a different code.')
     await state.clear(); await m.answer(msg); await render_promos(m)
@@ -274,8 +297,9 @@ async def pdetail(c:CallbackQuery):
     p=db.get_promotion(int(c.data.split(':')[-1]));
     if not p: return await c.answer('Not found',show_alert=True)
     value=f"{p['value']}%" if p['kind']=='percent' else f"{p['value']} so'm"
+    daily=f"\nDaily window: {p['daily_start']}-{p['daily_end']} (every day)" if p.get('daily_start') else ''
     kb=InlineKeyboardBuilder(); btn(kb,'✏️ Edit promotion',f'm:promoedit:{p["id"]}'); btn(kb,'🔁 Activate/Deactivate',f'm:promotoggle:{p["id"]}'); btn(kb,'🗑 Delete',f'm:promodel:{p["id"]}'); btn(kb,'⬅️ Promotions','m:promos'); kb.adjust(1)
-    await c.message.edit_text(f"🔥 {p['name']}\nCode: {p['code']}\nDiscount: {value}\nStarts: {p['starts_at'] or 'now'}\nEnds: {p['ends_at'] or 'never'}\nMinimum: {p['min_subtotal']:,} so\'m\nUses: {p['used_count']}/{p['max_uses'] if p['max_uses'] else '∞'}\nStatus: {'ACTIVE' if p['active'] else 'INACTIVE'}",reply_markup=kb.as_markup()); await c.answer()
+    await c.message.edit_text(f"🔥 {p['name']}\nCode: {p['code']}\nDiscount: {value}\nStarts: {p['starts_at'] or 'now'}\nEnds: {p['ends_at'] or 'never'}{daily}\nMinimum: {p['min_subtotal']:,} so\'m\nUses: {p['used_count']}/{p['max_uses'] if p['max_uses'] else '∞'}\nStatus: {'ACTIVE' if p['active'] else 'INACTIVE'}",reply_markup=kb.as_markup()); await c.answer()
 
 @router.callback_query(F.data.startswith('m:promoedit:'))
 async def pedit(c:CallbackQuery,state:FSMContext):
@@ -346,15 +370,41 @@ async def order_cancel(c:CallbackQuery):
     oid=c.data.split(':',2)[2]; db.cancel_order(oid); await orders(c); await c.answer('Cancelled')
 
 # ---------- analytics ----------
+def _analytics_blocks(rows_by_window):
+    blocks=[]
+    for label,rows in rows_by_window:
+        rev=sum(o['total'] for o in rows); avg=round(rev/len(rows)) if rows else 0
+        blocks.append(f"📊 {label}\nOrders: {len(rows)}\nRevenue: {rev:,} so'm\nAverage: {avg:,} so'm")
+    return blocks
+
+def _analytics_windows(all_rows_fn):
+    now=datetime.now(timezone.utc); starts=[now.replace(hour=0,minute=0,second=0,microsecond=0)-__import__('datetime').timedelta(days=d) for d in (0,6,29)]
+    return [(label, all_rows_fn(start_dt.isoformat())) for label,start_dt in zip(('TODAY','7 DAYS','30 DAYS'),starts)]
+
 @router.callback_query(F.data=='m:analytics')
 async def analytics(c:CallbackQuery):
     if not owner(c.from_user.id): return
-    now=datetime.now(timezone.utc); starts=[now.replace(hour=0,minute=0,second=0,microsecond=0)-__import__('datetime').timedelta(days=d) for d in (0,6,29)]
-    blocks=[]
-    for label,start_dt in zip(('TODAY','7 DAYS','30 DAYS'),starts):
-        rows=db.get_orders_since(start_dt.isoformat()); rev=sum(o['total'] for o in rows); avg=round(rev/len(rows)) if rows else 0
-        blocks.append(f"📊 {label}\nOrders: {len(rows)}\nRevenue: {rev:,} so'm\nAverage: {avg:,} so'm")
-    await c.message.edit_text("\n\n".join(blocks),reply_markup=back_kb()); await c.answer()
+    blocks=_analytics_blocks(_analytics_windows(db.get_orders_since))
+    kb=InlineKeyboardBuilder(); btn(kb,'🏪 Per-branch breakdown','m:analytics_branches'); btn(kb,'⬅️ Manager','m:home'); kb.adjust(1)
+    await c.message.edit_text("\n\n".join(blocks),reply_markup=kb.as_markup()); await c.answer()
+
+@router.callback_query(F.data=='m:analytics_branches')
+async def analytics_branches(c:CallbackQuery):
+    if not owner(c.from_user.id): return
+    rows=db.list_branches(); kb=InlineKeyboardBuilder()
+    for b in rows: btn(kb,("🟢 " if b['active'] else "⚪ ")+b['name'],f"m:analytics_branch:{b['id']}")
+    btn(kb,'⬅️ Analytics','m:analytics'); kb.adjust(1)
+    await c.message.edit_text("🏪 Choose a branch for its own Today / 7-day / 30-day numbers:",reply_markup=kb.as_markup()); await c.answer()
+
+@router.callback_query(F.data.startswith('m:analytics_branch:'))
+async def analytics_branch(c:CallbackQuery):
+    if not owner(c.from_user.id): return
+    b=db.get_branch(int(c.data.split(':')[-1]))
+    if not b: return await c.answer('Not found',show_alert=True)
+    def rows_for_branch(iso_dt): return [o for o in db.get_orders_since(iso_dt) if o.get('branch_name')==b['name']]
+    blocks=_analytics_blocks(_analytics_windows(rows_for_branch))
+    kb=InlineKeyboardBuilder(); btn(kb,'⬅️ Branches','m:analytics_branches'); kb.adjust(1)
+    await c.message.edit_text(f"🏪 {b['name']}\n\n"+"\n\n".join(blocks),reply_markup=kb.as_markup()); await c.answer()
 
 # ---------- birthday settings ----------
 @router.callback_query(F.data=='m:birthday')
@@ -384,3 +434,46 @@ async def bddays_set(m:Message,state:FSMContext):
     except ValueError: return await m.answer('Send a whole number.')
     if not 1<=v<=30: return await m.answer('Use 1–30.')
     db.set_setting('birthday_reward_valid_days',str(v)); await state.clear(); await m.answer('✅ Birthday validity updated.'); await m.answer('Use /manager → Birthday to review it.',reply_markup=manager_kb())
+
+# ---------- broadcast ----------
+@router.callback_query(F.data=='m:broadcast')
+async def broadcast_start(c:CallbackQuery,state:FSMContext):
+    if not owner(c.from_user.id): return
+    await state.set_state(MFlow.broadcast_text)
+    await c.message.answer("📢 Send the message to broadcast to every customer who has used the bot.\n\nThis goes out immediately to everyone once you confirm — there's a review step next.")
+    await c.answer()
+
+@router.message(MFlow.broadcast_text)
+async def broadcast_compose(m:Message,state:FSMContext):
+    if not owner(m.from_user.id): return
+    text=(m.text or '').strip()
+    if not text: return await m.answer('Send some text.')
+    await state.update_data(text=text)
+    count=len(db.get_all_user_ids())
+    kb=InlineKeyboardBuilder(); btn(kb,f'✅ Send to {count} customers','m:broadcast_confirm'); btn(kb,'❌ Cancel','m:broadcast_cancel'); kb.adjust(1)
+    await m.answer(f"Preview:\n\n{text}\n\nSend this to all {count} customers?",reply_markup=kb.as_markup())
+
+@router.callback_query(F.data=='m:broadcast_confirm')
+async def broadcast_confirm(c:CallbackQuery,state:FSMContext):
+    if not owner(c.from_user.id): return
+    d=await state.get_data(); text=d.get('text','')
+    await state.clear()
+    if not text:
+        await c.answer(); return
+    user_ids=db.get_all_user_ids(); sent=0
+    await c.message.edit_text('📢 Sending…')
+    for user_id in user_ids:
+        try:
+            await c.bot.send_message(user_id, text); sent+=1
+        except Exception:
+            pass
+        import asyncio as _asyncio; await _asyncio.sleep(0.05)
+    await c.message.edit_text(f'✅ Broadcast sent to {sent}/{len(user_ids)} customers.',reply_markup=back_kb())
+    await c.answer()
+
+@router.callback_query(F.data=='m:broadcast_cancel')
+async def broadcast_cancel(c:CallbackQuery,state:FSMContext):
+    if not owner(c.from_user.id): return
+    await state.clear()
+    await c.message.edit_text('Cancelled — nothing was sent.',reply_markup=back_kb())
+    await c.answer()
