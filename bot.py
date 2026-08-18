@@ -6,23 +6,24 @@
 import asyncio
 import os
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-import config
+from dotenv import load_dotenv
 
 import db
 import menu_store
 from handlers import router as customer_router, fmt_price
 from admin import router as admin_router, _aggregate, _format_report
 from texts import t
-from manager import router as manager_router
+
+load_dotenv()  # reads the .env file next to this one
 
 logging.basicConfig(level=logging.INFO)
 
 DAILY_SUMMARY_HOUR_UTC = 17  # ~22:00 Tashkent time (UTC+5) — edit this if the shop's hours change
-BIRTHDAY_CHECK_HOUR_UTC = 4  # retained for backwards compatibility; birthday_loop now runs once per local day
+BIRTHDAY_CHECK_HOUR_UTC = 4  # ~09:00 Tashkent time — sends birthday rewards early in the day
 
 
 async def daily_summary_loop(bot: Bot, owner_id: int):
@@ -49,24 +50,22 @@ async def daily_summary_loop(bot: Bot, owner_id: int):
 
 
 async def birthday_loop(bot: Bot):
-    """Checks once a day for birthdays and issues a 50% off one-drink reward."""
+    """Checks once a day for customers whose birthday is today and grants
+    them a free coffee automatically."""
     while True:
-        # Metropia operates on Tashkent time (UTC+5). Run once per local calendar day,
-        # regardless of when the process started, so a restart cannot skip birthdays.
-        now = datetime.now(timezone.utc) + timedelta(hours=5)
+        now = datetime.now(timezone.utc)
         today_key = now.strftime("%Y-%m-%d")
         month_day = now.strftime("%m-%d")
         already_sent = db.get_setting("birthday_check_date")
-        if already_sent != today_key:
+        if now.hour == BIRTHDAY_CHECK_HOUR_UTC and already_sent != today_key:
             try:
                 for user_id in db.get_birthdays_today(month_day):
-                    reward = db.issue_birthday_reward(user_id, now.year)
-                    if reward.get("new"):
-                        try:
-                            lang = db.get_user_language(user_id)
-                            await bot.send_message(user_id, t(lang, "birthday_gift_notice"))
-                        except Exception:
-                            pass  # customer may have blocked the bot
+                    db.grant_free_coffee(user_id)
+                    try:
+                        lang = db.get_user_language(user_id)
+                        await bot.send_message(user_id, t(lang, "birthday_gift_notice"))
+                    except Exception:
+                        pass  # customer may have blocked the bot
             except Exception:
                 pass  # don't let a failed birthday check crash the whole bot
             db.set_setting("birthday_check_date", today_key)
@@ -74,7 +73,7 @@ async def birthday_loop(bot: Bot):
 
 
 async def main():
-    token = config.BOT_TOKEN
+    token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN is missing — open the .env file and paste your bot token there.")
 
@@ -84,11 +83,10 @@ async def main():
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(manager_router)
     dp.include_router(admin_router)
     dp.include_router(customer_router)
 
-    owner_id = config.OWNER_TELEGRAM_ID
+    owner_id = int(os.environ.get("OWNER_TELEGRAM_ID", "0"))
     asyncio.create_task(daily_summary_loop(bot, owner_id))
     asyncio.create_task(birthday_loop(bot))
 

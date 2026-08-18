@@ -41,7 +41,7 @@ Good news: both providers are connected the same simple way, directly through Te
 5. Repeat the same steps for **Payme** → paste that token after `PAYME_PROVIDER_TOKEN=`
 6. Restart the bot (see step 6)
 
-You don't need both ready before launching. The checkout only shows a provider when its token is configured; **Cash** is always available.
+You don't need both ready before launching — customers will see both **Click** and **Payme** as options at checkout, and whichever one isn't connected yet will just show a payment error if picked, so let me know if you want to prioritize one first.
 
 ## 5. Test it yourself
 
