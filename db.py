@@ -162,6 +162,20 @@ def get_all_user_ids() -> list[int]:
     return [r[0] for r in rows]
 
 
+def get_inactive_user_ids(days: int) -> list[int]:
+    """Customers who have used the bot before but haven't placed a paid order
+    in the last N days — used for win-back broadcasts."""
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    with get_db() as conn:
+        active_recently = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT user_id FROM orders WHERE status = 'paid' AND created_at >= ?", (cutoff,)
+            ).fetchall()
+        }
+        all_users = {r[0] for r in conn.execute("SELECT user_id FROM users").fetchall()}
+    return list(all_users - active_recently)
+
+
 # ---- onboarding profile (name, saved phone, home branch) ----
 
 def save_full_name(user_id: int, full_name: str):

@@ -144,23 +144,29 @@ async def respond(target, text: str, reply_markup=None, parse_mode: str | None =
     step in the ordering flow. When the step was reached by tapping a button,
     this EDITS that same message in place instead of sending a new one — so
     browsing the menu doesn't flood the chat with dozens of old messages.
-    When reached via a typed command (no previous bot message to edit), it
-    just sends normally. Returns the resulting message, so callers can track
-    it with track_checkout_message() if it needs cleaning up later.
+    When reached via a typed command or the persistent bottom keyboard (no
+    previous bot message to edit), it sends a new message instead.
+
+    Every message this produces is tracked automatically (see
+    track_checkout_message below), so cleanup_checkout_messages() — called
+    once an order finishes — can wipe the whole chat clean for the next
+    order, not just the checkout-specific prompts.
 
     parse_mode is opt-in per call (not a bot-wide default) — several admin/
     staff messages contain literal '<' '>' characters (e.g. "/cash <amount>")
     that would break HTML parsing if it were on everywhere."""
     if isinstance(target, CallbackQuery):
         try:
-            return await target.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            msg = await target.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception:
             # message has no editable text (e.g. was a photo), or content is
             # byte-for-byte identical to what's already shown — either way,
             # falling back to a fresh message is always safe.
-            return await target.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            msg = await target.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
     else:
-        return await target.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        msg = await target.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    track_checkout_message(target.from_user.id, msg.message_id)
+    return msg
 
 
 def esc(value) -> str:
@@ -242,6 +248,16 @@ async def start(message: Message):
             referrer_id = int(parts[1].removeprefix("ref_"))
             db.record_referral(message.from_user.id, referrer_id)
         except ValueError:
+            pass
+    elif len(parts) > 1 and parts[1].startswith("branch_"):
+        # scanned from a branch's QR code — pre-set their home branch so
+        # checkout skips the location-share step entirely for this customer
+        try:
+            branch_id = int(parts[1].removeprefix("branch_"))
+            branch = db.get_branch(branch_id)
+            if branch:
+                db.save_home_branch(message.from_user.id, branch["name"], branch.get("lat", 0), branch.get("lng", 0))
+        except (ValueError, TypeError):
             pass
 
     kb = InlineKeyboardBuilder()
@@ -491,9 +507,10 @@ async def choose_temp_or_size(callback: CallbackQuery):
         caption = f"<b>{esc(name)}</b>"
         if item.get("description"):
             caption += f"\n{esc(item['description'])}"
-        await callback.bot.send_photo(
+        photo_msg = await callback.bot.send_photo(
             callback.from_user.id, item["photo_file_id"], caption=caption, parse_mode="HTML"
         )
+        track_checkout_message(callback.from_user.id, photo_msg.message_id)
 
     temps = temps_for(item)
 
@@ -603,9 +620,11 @@ def ensure_cart(user_id: int) -> list[dict]:
         CART[user_id] = db.load_cart(user_id)
     return CART[user_id]
 
-# Tracks bot messages sent during checkout (contact/fulfillment/location/notes/pickup-time
-# prompts) so they can all be deleted once the order completes — customers have a Back
-# button for navigating while it's in progress, so nothing is lost by cleaning up after.
+# Tracks every bot message sent since the customer's last completed order —
+# menu browsing, cart views, item photos, checkout prompts, promo entry, all
+# of it (respond() tracks automatically; a handful of spots that bypass it,
+# like photos and multi-message screens, track explicitly). Cleared out in
+# one batch once an order finishes, so the next order starts on a clean chat.
 CHECKOUT_MESSAGES: dict[int, list[int]] = {}
 
 
@@ -1158,26 +1177,32 @@ async def birthday_item_selected(callback: CallbackQuery, state: FSMContext):
 async def promo_command(message: Message, state: FSMContext):
     lang=lang_of(message.from_user.id); parts=(message.text or "").split(maxsplit=1)
     if len(parts)<2:
-        await message.answer(promo_label(lang,"enter")); await state.set_state(OrderFlow.awaiting_promo_code); return
+        sent=await message.answer(promo_label(lang,"enter")); track_checkout_message(message.from_user.id, sent.message_id)
+        await state.set_state(OrderFlow.awaiting_promo_code); return
     code=parts[1].strip().upper(); subtotal=cart_total(message.from_user.id); discount,p=promotion_discount(message.from_user.id,code,subtotal)
-    if not p: await message.answer(promo_label(lang,"invalid")); return
-    await state.update_data(promo_code=code,promo_discount=discount); await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)))
+    if not p:
+        sent=await message.answer(promo_label(lang,"invalid")); track_checkout_message(message.from_user.id, sent.message_id); return
+    await state.update_data(promo_code=code,promo_discount=discount)
+    sent=await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount))); track_checkout_message(message.from_user.id, sent.message_id)
 
 @router.callback_query(F.data == "promo_enter")
 async def promo_enter(callback: CallbackQuery, state: FSMContext):
     lang=lang_of(callback.from_user.id)
     await state.set_state(OrderFlow.awaiting_promo_code)
-    await callback.message.answer(promo_label(lang,"enter"))
+    sent=await callback.message.answer(promo_label(lang,"enter"))
+    track_checkout_message(callback.from_user.id, sent.message_id)
     await callback.answer()
 
 @router.message(OrderFlow.awaiting_promo_code)
 async def promo_received(message: Message, state: FSMContext):
     lang=lang_of(message.from_user.id); code=(message.text or "").strip().upper(); subtotal=cart_total(message.from_user.id)
     discount,p=promotion_discount(message.from_user.id,code,subtotal)
+    track_checkout_message(message.from_user.id, message.message_id)  # their typed promo code
     if not p:
-        await message.answer(promo_label(lang,"invalid")); return
+        sent=await message.answer(promo_label(lang,"invalid")); track_checkout_message(message.from_user.id, sent.message_id); return
     await state.update_data(promo_code=code,promo_discount=discount)
-    await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)))
+    sent=await message.answer(promo_label(lang,"applied").format(discount=fmt_price(discount)))
+    track_checkout_message(message.from_user.id, sent.message_id)
     await prompt_payment(message.from_user.id, lang, state, send=message.answer)
 
 @router.callback_query(F.data.startswith("paymethod:"))
@@ -1280,7 +1305,8 @@ async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str
     CART[callback.from_user.id] = []
     db.clear_cart(callback.from_user.id)
     await cleanup_checkout_messages(callback.bot, callback.from_user.id)
-    await callback.message.answer(t(lang, "cash_order_placed_customer"))
+    placed_msg = await callback.message.answer(t(lang, "cash_order_placed_customer"))
+    track_checkout_message(callback.from_user.id, placed_msg.message_id)
     await callback.answer()
 
 
@@ -1847,6 +1873,21 @@ async def rate_order(callback: CallbackQuery):
     await callback.message.edit_text(t(lang, "rating_thanks", stars="⭐" * int(stars)), reply_markup=kb.as_markup())
     await callback.answer()
 
+    if int(stars) <= 2:
+        alert_chat_id = STAFF_GROUP_ID or OWNER_ID
+        if alert_chat_id:
+            username = f"@{callback.from_user.username}" if callback.from_user.username else str(callback.from_user.id)
+            alert_text = (
+                f"⚠️ LOW RATING: {'⭐' * int(stars)}{'☆' * (5 - int(stars))}\n"
+                f"Order #{order['order_number']} — {order['branch_name'] or '—'}\n"
+                f"Customer: {username}" + (f" ({order['phone']})" if order["phone"] else "") + "\n"
+                f"{order['items_summary'] or ''}"
+            )
+            try:
+                await callback.bot.send_message(alert_chat_id, alert_text)
+            except Exception:
+                pass  # don't let a failed alert affect the customer-facing flow
+
 
 
 
@@ -1890,10 +1931,12 @@ async def my_orders_command(message: Message):
     lang = lang_of(message.from_user.id)
     orders = db.get_recent_orders(message.from_user.id, limit=5)
     if not orders:
-        await message.answer(t(lang, "no_past_orders"))
+        sent = await message.answer(t(lang, "no_past_orders"))
+        track_checkout_message(message.from_user.id, sent.message_id)
         return
 
-    await message.answer(t(lang, "past_orders_header"))
+    header_msg = await message.answer(t(lang, "past_orders_header"))
+    track_checkout_message(message.from_user.id, header_msg.message_id)
     for o in orders:
         date = o["created_at"][:10]
         block = f"{date} — {fmt_price(o['total'])} so'm\n{o['items_summary'] or '—'}"
@@ -1904,7 +1947,8 @@ async def my_orders_command(message: Message):
             kb = InlineKeyboardBuilder()
             kb.button(text=t(lang, "order_again_button"), callback_data=f"reorder:{o['order_id']}")
             kb = kb.as_markup()
-        await message.answer(block, reply_markup=kb)
+        order_msg = await message.answer(block, reply_markup=kb)
+        track_checkout_message(message.from_user.id, order_msg.message_id)
 
 
 @router.callback_query(F.data.startswith("reorder:"))
@@ -1948,11 +1992,13 @@ async def show_stamps(user_id: int, send):
     markup = kb.as_markup()
 
     if not status:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet") + "\n\n" + code_line, reply_markup=markup)
+        sent = await send(t(lang, "stamps_header") + "\n" + t(lang, "stamps_none_yet") + "\n\n" + code_line, reply_markup=markup)
+        track_checkout_message(user_id, sent.message_id)
         return
 
     if status["free_coffee_pending"]:
-        await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready") + "\n\n" + code_line, reply_markup=markup)
+        sent = await send(t(lang, "stamps_header") + "\n" + t(lang, "free_coffee_ready") + "\n\n" + code_line, reply_markup=markup)
+        track_checkout_message(user_id, sent.message_id)
         return
 
     stamps = status["stamps"]
@@ -1962,7 +2008,8 @@ async def show_stamps(user_id: int, send):
         expires = datetime.fromisoformat(status["first_stamp_at"]) + timedelta(days=db.CARD_VALID_DAYS)
         text += t(lang, "stamps_valid_until", date=expires.strftime("%d.%m.%Y"))
     text += "\n\n" + code_line
-    await send(text, reply_markup=markup)
+    sent = await send(text, reply_markup=markup)
+    track_checkout_message(user_id, sent.message_id)
 
 
 @router.callback_query(F.data == "cashrequest")

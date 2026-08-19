@@ -1,6 +1,7 @@
 """Metropia Manager — owner-only operational controls."""
 from datetime import datetime, timezone
 import sqlite3
+from urllib.parse import quote
 import db, menu_store, branches, config
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -149,8 +150,21 @@ async def branch_detail(c:CallbackQuery):
     if not owner(c.from_user.id): return
     bid=int(c.data.split(':')[-1]); b=db.get_branch(bid)
     if not b: return await c.answer("Not found",show_alert=True)
-    kb=InlineKeyboardBuilder(); btn(kb,"✏️ Edit location",f"m:branchedit:{bid}"); btn(kb,"🔁 Activate/Deactivate",f"m:branchtoggle:{bid}"); btn(kb,"🗑 Delete",f"m:branchdel:{bid}"); btn(kb,"⬅️ Locations","m:branches"); kb.adjust(1)
+    kb=InlineKeyboardBuilder(); btn(kb,"✏️ Edit location",f"m:branchedit:{bid}"); btn(kb,"📱 QR code",f"m:branchqr:{bid}"); btn(kb,"🔁 Activate/Deactivate",f"m:branchtoggle:{bid}"); btn(kb,"🗑 Delete",f"m:branchdel:{bid}"); btn(kb,"⬅️ Locations","m:branches"); kb.adjust(1)
     await c.message.edit_text(f"🏪 {b['name']}\n📍 {b['address']}\n🧭 {b['lat']}, {b['lng']}\n☎️ {b['phone'] or '-'}\n🕒 {b['hours']}\nPickup: {'YES' if b['pickup_enabled'] else 'NO'}\nDelivery: {'YES' if b['delivery_enabled'] else 'NO'}\nStatus: {'ACTIVE' if b['active'] else 'INACTIVE'}",reply_markup=kb.as_markup()); await c.answer()
+
+@router.callback_query(F.data.startswith("m:branchqr:"))
+async def branch_qr(c:CallbackQuery):
+    if not owner(c.from_user.id): return
+    bid=int(c.data.split(':')[-1]); b=db.get_branch(bid)
+    if not b: return await c.answer("Not found",show_alert=True)
+    me=await c.bot.get_me()
+    deep_link=f"https://t.me/{me.username}?start=branch_{bid}"
+    qr_image_url=f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&data={quote(deep_link)}"
+    kb=InlineKeyboardBuilder(); btn(kb,"⬅️ Back",f"m:branch:{bid}"); kb.adjust(1)
+    caption=f"📱 QR code for {b['name']}\n\nPrint this on a table tent or at the counter. Scanning it opens the bot with this branch pre-selected — customers skip the location-share step at checkout.\n\nLink: {deep_link}"
+    await c.message.answer_photo(qr_image_url, caption=caption, reply_markup=kb.as_markup())
+    await c.answer()
 
 @router.callback_query(F.data.startswith("m:branchedit:"))
 async def branch_edit_start(c:CallbackQuery,state:FSMContext):
@@ -439,33 +453,52 @@ async def bddays_set(m:Message,state:FSMContext):
 @router.callback_query(F.data=='m:broadcast')
 async def broadcast_start(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    await state.set_state(MFlow.broadcast_text)
-    await c.message.answer("📢 Send what you want to broadcast to every customer who has used the bot.\n\nEither send a photo with a caption (for a picture ad), or just plain text.\n\nThis goes out immediately to everyone once you confirm — there's a review step next.")
+    kb=InlineKeyboardBuilder()
+    btn(kb, f"👥 All customers ({len(db.get_all_user_ids())})", 'm:broadcast_audience:all')
+    btn(kb, f"🔁 Win-back — inactive 30+ days ({len(db.get_inactive_user_ids(30))})", 'm:broadcast_audience:winback')
+    btn(kb, '⬅️ Manager', 'm:home')
+    kb.adjust(1)
+    await c.message.edit_text("📢 Who should this broadcast go to?", reply_markup=kb.as_markup())
     await c.answer()
+
+@router.callback_query(F.data.startswith('m:broadcast_audience:'))
+async def broadcast_audience(c:CallbackQuery,state:FSMContext):
+    if not owner(c.from_user.id): return
+    audience=c.data.split(':')[-1]
+    await state.update_data(audience=audience)
+    await state.set_state(MFlow.broadcast_text)
+    label='all customers' if audience=='all' else 'customers inactive 30+ days (win-back)'
+    await c.message.answer(f"📢 Send what you want to broadcast to {label}.\n\nEither send a photo with a caption (for a picture ad), or just plain text.\n\nThis goes out immediately to that group once you confirm — there's a review step next.")
+    await c.answer()
+
+def _broadcast_recipients(audience:str) -> list[int]:
+    return db.get_inactive_user_ids(30) if audience=='winback' else db.get_all_user_ids()
 
 @router.message(MFlow.broadcast_text, F.photo)
 async def broadcast_compose_photo(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     caption=(m.caption or '').strip()
+    d=await state.get_data(); audience=d.get('audience','all')
     await state.update_data(kind='photo', photo_id=m.photo[-1].file_id, text=caption)
-    count=len(db.get_all_user_ids())
+    count=len(_broadcast_recipients(audience))
     kb=InlineKeyboardBuilder(); btn(kb,f'✅ Send to {count} customers','m:broadcast_confirm'); btn(kb,'❌ Cancel','m:broadcast_cancel'); kb.adjust(1)
-    await m.answer_photo(m.photo[-1].file_id, caption=f"Preview — this exact photo/caption goes to all {count} customers:\n\n{caption or '(no caption)'}", reply_markup=kb.as_markup())
+    await m.answer_photo(m.photo[-1].file_id, caption=f"Preview — this exact photo/caption goes to {count} customers:\n\n{caption or '(no caption)'}", reply_markup=kb.as_markup())
 
 @router.message(MFlow.broadcast_text)
 async def broadcast_compose(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     text=(m.text or '').strip()
     if not text: return await m.answer('Send some text, or a photo with a caption.')
+    d=await state.get_data(); audience=d.get('audience','all')
     await state.update_data(kind='text', text=text)
-    count=len(db.get_all_user_ids())
+    count=len(_broadcast_recipients(audience))
     kb=InlineKeyboardBuilder(); btn(kb,f'✅ Send to {count} customers','m:broadcast_confirm'); btn(kb,'❌ Cancel','m:broadcast_cancel'); kb.adjust(1)
-    await m.answer(f"Preview:\n\n{text}\n\nSend this to all {count} customers?",reply_markup=kb.as_markup())
+    await m.answer(f"Preview:\n\n{text}\n\nSend this to {count} customers?",reply_markup=kb.as_markup())
 
 @router.callback_query(F.data=='m:broadcast_confirm')
 async def broadcast_confirm(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    d=await state.get_data(); kind=d.get('kind','text'); text=d.get('text',''); photo_id=d.get('photo_id')
+    d=await state.get_data(); kind=d.get('kind','text'); text=d.get('text',''); photo_id=d.get('photo_id'); audience=d.get('audience','all')
     await state.clear()
     if kind=='photo' and not photo_id:
         await c.answer(); return
@@ -477,7 +510,7 @@ async def broadcast_confirm(c:CallbackQuery,state:FSMContext):
     else:
         await c.message.edit_text('📢 Sending…')
 
-    user_ids=db.get_all_user_ids(); sent=0
+    user_ids=_broadcast_recipients(audience); sent=0
     import asyncio as _asyncio
     for user_id in user_ids:
         try:
