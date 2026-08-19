@@ -790,7 +790,7 @@ async def checkout_callback(callback: CallbackQuery, state: FSMContext):
     if db.get_setting("ordering_paused") == "1":
         await callback.answer(t(lang, "ordering_paused_notice"), show_alert=True)
         return
-    CHECKOUT_MESSAGES[callback.from_user.id] = [callback.message.message_id]
+    track_checkout_message(callback.from_user.id, callback.message.message_id)
 
     if not db.get_full_name(callback.from_user.id):
         db.save_full_name(callback.from_user.id, callback.from_user.full_name or "Customer")
