@@ -178,10 +178,10 @@ def add_nav_row(kb: InlineKeyboardBuilder, lang: str, back_callback: str):
 def main_menu_keyboard(lang: str):
     # Keep the customer home screen intentionally small: Order, Cart, Rewards, Orders.
     kb = InlineKeyboardBuilder()
-    kb.button(text="☕ " + t(lang, "menu_button"), callback_data="menu")
-    kb.button(text="🛒 " + t(lang, "cart_button"), callback_data="cart")
-    kb.button(text="🎁 " + t(lang, "stamps_button"), callback_data="stamps")
-    kb.button(text="🧾 " + t(lang, "my_orders_button"), callback_data="myorders")
+    kb.button(text=t(lang, "menu_button"), callback_data="menu")
+    kb.button(text=t(lang, "cart_button"), callback_data="cart")
+    kb.button(text=t(lang, "stamps_button"), callback_data="stamps")
+    kb.button(text=t(lang, "my_orders_button"), callback_data="myorders")
     kb.adjust(2, 2)
     return kb.as_markup()
 

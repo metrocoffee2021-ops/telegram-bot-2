@@ -440,15 +440,24 @@ async def bddays_set(m:Message,state:FSMContext):
 async def broadcast_start(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
     await state.set_state(MFlow.broadcast_text)
-    await c.message.answer("📢 Send the message to broadcast to every customer who has used the bot.\n\nThis goes out immediately to everyone once you confirm — there's a review step next.")
+    await c.message.answer("📢 Send what you want to broadcast to every customer who has used the bot.\n\nEither send a photo with a caption (for a picture ad), or just plain text.\n\nThis goes out immediately to everyone once you confirm — there's a review step next.")
     await c.answer()
+
+@router.message(MFlow.broadcast_text, F.photo)
+async def broadcast_compose_photo(m:Message,state:FSMContext):
+    if not owner(m.from_user.id): return
+    caption=(m.caption or '').strip()
+    await state.update_data(kind='photo', photo_id=m.photo[-1].file_id, text=caption)
+    count=len(db.get_all_user_ids())
+    kb=InlineKeyboardBuilder(); btn(kb,f'✅ Send to {count} customers','m:broadcast_confirm'); btn(kb,'❌ Cancel','m:broadcast_cancel'); kb.adjust(1)
+    await m.answer_photo(m.photo[-1].file_id, caption=f"Preview — this exact photo/caption goes to all {count} customers:\n\n{caption or '(no caption)'}", reply_markup=kb.as_markup())
 
 @router.message(MFlow.broadcast_text)
 async def broadcast_compose(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     text=(m.text or '').strip()
-    if not text: return await m.answer('Send some text.')
-    await state.update_data(text=text)
+    if not text: return await m.answer('Send some text, or a photo with a caption.')
+    await state.update_data(kind='text', text=text)
     count=len(db.get_all_user_ids())
     kb=InlineKeyboardBuilder(); btn(kb,f'✅ Send to {count} customers','m:broadcast_confirm'); btn(kb,'❌ Cancel','m:broadcast_cancel'); kb.adjust(1)
     await m.answer(f"Preview:\n\n{text}\n\nSend this to all {count} customers?",reply_markup=kb.as_markup())
@@ -456,24 +465,44 @@ async def broadcast_compose(m:Message,state:FSMContext):
 @router.callback_query(F.data=='m:broadcast_confirm')
 async def broadcast_confirm(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    d=await state.get_data(); text=d.get('text','')
+    d=await state.get_data(); kind=d.get('kind','text'); text=d.get('text',''); photo_id=d.get('photo_id')
     await state.clear()
-    if not text:
+    if kind=='photo' and not photo_id:
         await c.answer(); return
+    if kind=='text' and not text:
+        await c.answer(); return
+
+    if kind=='photo':
+        await c.message.edit_caption(caption='📢 Sending…')
+    else:
+        await c.message.edit_text('📢 Sending…')
+
     user_ids=db.get_all_user_ids(); sent=0
-    await c.message.edit_text('📢 Sending…')
+    import asyncio as _asyncio
     for user_id in user_ids:
         try:
-            await c.bot.send_message(user_id, text); sent+=1
+            if kind=='photo':
+                await c.bot.send_photo(user_id, photo_id, caption=text or None)
+            else:
+                await c.bot.send_message(user_id, text)
+            sent+=1
         except Exception:
             pass
-        import asyncio as _asyncio; await _asyncio.sleep(0.05)
-    await c.message.edit_text(f'✅ Broadcast sent to {sent}/{len(user_ids)} customers.',reply_markup=back_kb())
+        await _asyncio.sleep(0.05)
+
+    result_text=f'✅ Broadcast sent to {sent}/{len(user_ids)} customers.'
+    if kind=='photo':
+        await c.bot.send_message(c.from_user.id, result_text, reply_markup=back_kb())
+    else:
+        await c.message.edit_text(result_text,reply_markup=back_kb())
     await c.answer()
 
 @router.callback_query(F.data=='m:broadcast_cancel')
 async def broadcast_cancel(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
     await state.clear()
-    await c.message.edit_text('Cancelled — nothing was sent.',reply_markup=back_kb())
+    if c.message.photo:
+        await c.bot.send_message(c.from_user.id, 'Cancelled — nothing was sent.', reply_markup=back_kb())
+    else:
+        await c.message.edit_text('Cancelled — nothing was sent.',reply_markup=back_kb())
     await c.answer()
