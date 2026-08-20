@@ -632,16 +632,27 @@ def track_checkout_message(user_id: int, message_id: int):
     CHECKOUT_MESSAGES.setdefault(user_id, []).append(message_id)
 
 
-async def cleanup_checkout_messages(bot, user_id: int):
-    for message_id in CHECKOUT_MESSAGES.pop(user_id, []):
+async def cleanup_checkout_messages(bot, user_id: int, up_to_message_id: int | None = None):
+    tracked = CHECKOUT_MESSAGES.pop(user_id, [])
+    ids_to_delete = set(tracked)
+    if tracked:
+        upper = up_to_message_id or max(tracked)
+        # Belt-and-suspenders: also delete every message ID in the range from
+        # the earliest tracked message up to this one. Telegram message IDs
+        # are sequential per chat, so this sweeps up anything not explicitly
+        # tracked too — an invoice message, Telegram's own "payment
+        # successful" bubble, or any spot that got missed — without needing
+        # to find and fix every single call site by hand.
+        ids_to_delete.update(range(min(tracked), upper + 1))
+    for message_id in ids_to_delete:
         try:
             await bot.delete_message(user_id, message_id)
         except Exception:
             pass  # message may already be gone, or too old to delete (Telegram's 48h limit) — harmless either way
 
 
-async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_you_text: str):
-    await cleanup_checkout_messages(bot, user_id)
+async def finish_order_and_return_to_menu(bot, user_id: int, lang: str, thank_you_text: str, up_to_message_id: int | None = None):
+    await cleanup_checkout_messages(bot, user_id, up_to_message_id)
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "new_order_button"), callback_data="menu")
     await bot.send_message(user_id, thank_you_text, reply_markup=kb.as_markup(), parse_mode="HTML")
@@ -1264,7 +1275,7 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
     amount_tiyin = total * 100
 
     try:
-        await callback.bot.send_invoice(
+        invoice_msg = await callback.bot.send_invoice(
             chat_id=callback.from_user.id,
             title=t(lang, "invoice_title"),
             description=t(lang, "invoice_description"),
@@ -1273,6 +1284,7 @@ async def payment_method_chosen(callback: CallbackQuery, state: FSMContext):
             currency="UZS",
             prices=[LabeledPrice(label=t(lang, "total"), amount=amount_tiyin)],
         )
+        track_checkout_message(callback.from_user.id, invoice_msg.message_id)
     except Exception as e:
         # Without this, a bad/misconfigured provider token throws here and the
         # callback never gets answered — the button just spins forever on the
@@ -1304,7 +1316,7 @@ async def handle_cash_checkout(callback: CallbackQuery, order_id: str, lang: str
 
     CART[callback.from_user.id] = []
     db.clear_cart(callback.from_user.id)
-    await cleanup_checkout_messages(callback.bot, callback.from_user.id)
+    await cleanup_checkout_messages(callback.bot, callback.from_user.id, up_to_message_id=callback.message.message_id)
     placed_msg = await callback.message.answer(t(lang, "cash_order_placed_customer"))
     track_checkout_message(callback.from_user.id, placed_msg.message_id)
     await callback.answer()
@@ -1380,7 +1392,7 @@ async def handle_bundle_checkout(callback: CallbackQuery, order_id: str, cart_sn
         reply += "\n" + milestone
     remaining = db.get_bundle_credits(callback.from_user.id)
     reply += "\n" + t(lang, "bundle_credits_remaining", credits=remaining)
-    await finish_order_and_return_to_menu(callback.bot, callback.from_user.id, lang, reply)
+    await finish_order_and_return_to_menu(callback.bot, callback.from_user.id, lang, reply, up_to_message_id=callback.message.message_id)
 
     notify_chat_id = STAFF_GROUP_ID or OWNER_ID
     if notify_chat_id:
@@ -1519,6 +1531,7 @@ async def handle_successful_payment(message: Message):
         await handle_bundle_purchase_payment(message)
         return
 
+    track_checkout_message(message.from_user.id, message.message_id)  # Telegram's own "payment successful" bubble
     db.set_order_gateway_ref(order_id, payment.telegram_payment_charge_id)
     db.mark_order_paid(order_id)
     today_str = db.now_utc().strftime("%Y-%m-%d")
@@ -1541,7 +1554,7 @@ async def handle_successful_payment(message: Message):
     milestone = milestone_line(lang, db.get_order_count(message.from_user.id))
     if milestone:
         reply += "\n" + milestone
-    await finish_order_and_return_to_menu(message.bot, message.from_user.id, lang, reply)
+    await finish_order_and_return_to_menu(message.bot, message.from_user.id, lang, reply, up_to_message_id=message.message_id)
 
     # Staff notification — without this, nobody at the shop knows an order came in.
     notify_chat_id = STAFF_GROUP_ID or OWNER_ID
