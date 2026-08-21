@@ -43,8 +43,9 @@ async def status(m:Message):
     else: await m.answer(f"Your Telegram ID: {m.from_user.id}\nOwner configured: {'yes' if config.OWNER_TELEGRAM_ID else 'no'}")
 
 @router.callback_query(F.data=="m:home")
-async def home(c:CallbackQuery):
+async def home(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
+    await state.clear()
     await c.message.edit_text("🖤 METROPIA MANAGER\n\nChoose what you want to manage:",reply_markup=manager_kb()); await c.answer()
 
 # ---------- locations ----------
@@ -63,7 +64,7 @@ async def branches_menu(c:CallbackQuery):
 @router.callback_query(F.data=="m:branch_add")
 async def branch_add(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    await state.set_state(MFlow.branch_name); await c.message.answer("Send branch name:"); await c.answer()
+    await state.set_state(MFlow.branch_name); await c.message.answer("Send branch name:",reply_markup=back_kb()); await c.answer()
 
 @router.message(MFlow.branch_name)
 async def bname(m:Message,state:FSMContext):
@@ -71,9 +72,9 @@ async def bname(m:Message,state:FSMContext):
     d=await state.get_data(); raw=(m.text or '').strip()
     if 'edit_id' in d:
         b=db.get_branch(d['edit_id']); name=b['name'] if raw.upper()=='SAME' else raw
-        await state.update_data(name=name); await state.set_state(MFlow.branch_address); await m.answer(f"Current address: {b['address']}\nSend new address (or SAME):")
+        await state.update_data(name=name); await state.set_state(MFlow.branch_address); await m.answer(f"Current address: {b['address']}\nSend new address (or SAME):",reply_markup=back_kb())
         return
-    await state.update_data(name=raw); await state.set_state(MFlow.branch_address); await m.answer("Send address:")
+    await state.update_data(name=raw); await state.set_state(MFlow.branch_address); await m.answer("Send address:",reply_markup=back_kb())
 
 @router.message(MFlow.branch_address)
 async def baddr(m:Message,state:FSMContext):
@@ -81,9 +82,9 @@ async def baddr(m:Message,state:FSMContext):
     d=await state.get_data(); raw=(m.text or '').strip()
     if 'edit_id' in d:
         b=db.get_branch(d['edit_id']); addr=b['address'] if raw.upper()=='SAME' else raw
-        await state.update_data(address=addr); await state.set_state(MFlow.branch_lat); await m.answer(f"Current latitude: {b['lat']}\nSend new latitude (or SAME):")
+        await state.update_data(address=addr); await state.set_state(MFlow.branch_lat); await m.answer(f"Current latitude: {b['lat']}\nSend new latitude (or SAME):",reply_markup=back_kb())
         return
-    await state.update_data(address=raw); await state.set_state(MFlow.branch_lat); await m.answer("Send latitude:")
+    await state.update_data(address=raw); await state.set_state(MFlow.branch_lat); await m.answer("Send latitude:",reply_markup=back_kb())
 
 @router.message(MFlow.branch_lat)
 async def blat(m:Message,state:FSMContext):
@@ -91,8 +92,8 @@ async def blat(m:Message,state:FSMContext):
     d=await state.get_data(); raw=(m.text or '').strip()
     try:
         v=db.get_branch(d['edit_id'])['lat'] if 'edit_id' in d and raw.upper()=='SAME' else float(raw)
-    except (ValueError,TypeError): return await m.answer("Invalid latitude. Send a number.")
-    await state.update_data(lat=v); await state.set_state(MFlow.branch_lng); await m.answer("Send longitude:")
+    except (ValueError,TypeError): return await m.answer("Invalid latitude. Send a number.",reply_markup=back_kb())
+    await state.update_data(lat=v); await state.set_state(MFlow.branch_lng); await m.answer("Send longitude:",reply_markup=back_kb())
 
 @router.message(MFlow.branch_lng)
 async def blng(m:Message,state:FSMContext):
@@ -100,26 +101,26 @@ async def blng(m:Message,state:FSMContext):
     d=await state.get_data(); raw=(m.text or '').strip()
     try:
         v=db.get_branch(d['edit_id'])['lng'] if 'edit_id' in d and raw.upper()=='SAME' else float(raw)
-    except (ValueError,TypeError): return await m.answer("Invalid longitude. Send a number.")
+    except (ValueError,TypeError): return await m.answer("Invalid longitude. Send a number.",reply_markup=back_kb())
     await state.update_data(lng=v)
     await state.set_state(MFlow.branch_phone)
     current=db.get_branch(d['edit_id']) if 'edit_id' in d else None
-    await m.answer(f"Phone number (or SAME): {current['phone'] if current else 'optional'}")
+    await m.answer(f"Phone number (or SAME): {current['phone'] if current else 'optional'}",reply_markup=back_kb())
 
 @router.message(MFlow.branch_phone)
 async def bphone(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); raw=(m.text or '').strip(); b=db.get_branch(d['edit_id']) if 'edit_id' in d else None
     await state.update_data(phone=(b['phone'] if b and raw.upper()=='SAME' else raw))
-    await state.set_state(MFlow.branch_hours); await m.answer(f"Opening hours (e.g. 08:00-23:00, or SAME): {b['hours'] if b else '08:00-23:00'}")
+    await state.set_state(MFlow.branch_hours); await m.answer(f"Opening hours (e.g. 08:00-23:00, or SAME): {b['hours'] if b else '08:00-23:00'}",reply_markup=back_kb())
 
 @router.message(MFlow.branch_hours)
 async def bhours(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); raw=(m.text or '').strip(); b=db.get_branch(d['edit_id']) if 'edit_id' in d else None
     hours=b['hours'] if b and raw.upper()=='SAME' else raw
-    if '-' not in hours or len(hours.split('-'))!=2: return await m.answer('Use format HH:MM-HH:MM.')
-    await state.update_data(hours=hours); await state.set_state(MFlow.branch_pickup); await m.answer('Pickup enabled? YES or NO' + (f" (current: {'YES' if b['pickup_enabled'] else 'NO'})" if b else ''))
+    if '-' not in hours or len(hours.split('-'))!=2: return await m.answer('Use format HH:MM-HH:MM.',reply_markup=back_kb())
+    await state.update_data(hours=hours); await state.set_state(MFlow.branch_pickup); await m.answer('Pickup enabled? YES or NO' + (f" (current: {'YES' if b['pickup_enabled'] else 'NO'})" if b else ''),reply_markup=back_kb())
 
 @router.message(MFlow.branch_pickup)
 async def bpickup(m:Message,state:FSMContext):
@@ -128,8 +129,8 @@ async def bpickup(m:Message,state:FSMContext):
     if raw=='SAME' and b: v=b['pickup_enabled']
     elif raw in ('YES','Y','HA','ДА'): v=1
     elif raw in ('NO','N','YOQ','НЕТ'): v=0
-    else: return await m.answer('Send YES or NO.')
-    await state.update_data(pickup=v); await state.set_state(MFlow.branch_delivery); await m.answer('Delivery enabled? YES or NO' + (f" (current: {'YES' if b['delivery_enabled'] else 'NO'})" if b else ''))
+    else: return await m.answer('Send YES or NO.',reply_markup=back_kb())
+    await state.update_data(pickup=v); await state.set_state(MFlow.branch_delivery); await m.answer('Delivery enabled? YES or NO' + (f" (current: {'YES' if b['delivery_enabled'] else 'NO'})" if b else ''),reply_markup=back_kb())
 
 @router.message(MFlow.branch_delivery)
 async def bdelivery(m:Message,state:FSMContext):
@@ -138,7 +139,7 @@ async def bdelivery(m:Message,state:FSMContext):
     if raw=='SAME' and b: v=b['delivery_enabled']
     elif raw in ('YES','Y','HA','ДА'): v=1
     elif raw in ('NO','N','YOQ','НЕТ'): v=0
-    else: return await m.answer('Send YES or NO.')
+    else: return await m.answer('Send YES or NO.',reply_markup=back_kb())
     if 'edit_id' in d:
         db.update_branch(d['edit_id'],d['name'],d['address'],d['lat'],d['lng'],d.get('phone',''),d.get('hours','08:00-23:00'),d.get('pickup',1),v); msg='✅ Location updated.'
     else:
@@ -171,7 +172,7 @@ async def branch_edit_start(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
     bid=int(c.data.split(':')[-1]); b=db.get_branch(bid)
     if not b: return await c.answer("Not found",show_alert=True)
-    await state.set_data({'edit_id':bid}); await state.set_state(MFlow.branch_name); await c.message.answer(f"Current name: {b['name']}\nSend new branch name (or type SAME):"); await c.answer()
+    await state.set_data({'edit_id':bid}); await state.set_state(MFlow.branch_name); await c.message.answer(f"Current name: {b['name']}\nSend new branch name (or type SAME):",reply_markup=back_kb()); await c.answer()
 
 @router.callback_query(F.data.startswith("m:branchtoggle:"))
 async def btog(c:CallbackQuery):
@@ -198,7 +199,7 @@ async def promos(c:CallbackQuery):
 @router.callback_query(F.data=="m:promo_add")
 async def pstart(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    await state.clear(); await state.set_state(MFlow.promo_name); await c.message.answer("Promotion name:"); await c.answer()
+    await state.clear(); await state.set_state(MFlow.promo_name); await c.message.answer("Promotion name:",reply_markup=back_kb()); await c.answer()
 
 @router.message(MFlow.promo_name)
 async def pname(m:Message,state:FSMContext):
@@ -207,9 +208,9 @@ async def pname(m:Message,state:FSMContext):
     if 'edit_id' in d and raw.upper()=='SAME': raw=db.get_promotion(d['edit_id'])['name']
     await state.update_data(name=raw)
     if 'edit_id' in d:
-        await state.set_state(MFlow.promo_code); await m.answer("Promo code (or SAME):")
+        await state.set_state(MFlow.promo_code); await m.answer("Promo code (or SAME):",reply_markup=back_kb())
     else:
-        await state.set_state(MFlow.promo_code); await m.answer("Promo code (example LATTE20):")
+        await state.set_state(MFlow.promo_code); await m.answer("Promo code (example LATTE20):",reply_markup=back_kb())
 
 @router.message(MFlow.promo_code)
 async def pcode(m:Message,state:FSMContext):
@@ -217,7 +218,7 @@ async def pcode(m:Message,state:FSMContext):
     d=await state.get_data(); raw=(m.text or '').strip().upper()
     if 'edit_id' in d and raw=='SAME': raw=db.get_promotion(d['edit_id'])['code']
     await state.update_data(code=raw); await state.set_state(MFlow.promo_type)
-    kb=InlineKeyboardBuilder(); btn(kb,"Percent %","m:ptype:percent"); btn(kb,"Fixed so'm","m:ptype:fixed"); kb.adjust(2); await m.answer("Choose discount type:",reply_markup=kb.as_markup())
+    kb=InlineKeyboardBuilder(); btn(kb,"Percent %","m:ptype:percent"); btn(kb,"Fixed so'm","m:ptype:fixed"); btn(kb,"⬅️ Manager","m:home"); kb.adjust(2,1); await m.answer("Choose discount type:",reply_markup=kb.as_markup())
 
 @router.callback_query(F.data.startswith('m:ptype:'))
 async def ptype(c:CallbackQuery,state:FSMContext):
@@ -226,7 +227,7 @@ async def ptype(c:CallbackQuery,state:FSMContext):
     current=''
     if 'edit_id' in d:
         p=db.get_promotion(d['edit_id']); current=f" Current value: {p['value']}. Send SAME to keep it."
-    await c.message.answer('Discount value (20 = 20%, or 10000 so\'m).'+current); await c.answer()
+    await c.message.answer('Discount value (20 = 20%, or 10000 so\'m).'+current,reply_markup=back_kb()); await c.answer()
 
 @router.message(MFlow.promo_value)
 async def pvalue(m:Message,state:FSMContext):
@@ -235,11 +236,11 @@ async def pvalue(m:Message,state:FSMContext):
     if 'edit_id' in d and raw.upper()=='SAME': v=db.get_promotion(d['edit_id'])['value']
     else:
         try: v=int(raw)
-        except ValueError: return await m.answer('Send a whole number.')
-    if v<=0 or (d['kind']=='percent' and v>100): return await m.answer('Invalid discount value.')
+        except ValueError: return await m.answer('Send a whole number.',reply_markup=back_kb())
+    if v<=0 or (d['kind']=='percent' and v>100): return await m.answer('Invalid discount value.',reply_markup=back_kb())
     await state.update_data(value=v); await state.set_state(MFlow.promo_start)
     p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None
-    await m.answer(f"Start date/time UTC YYYY-MM-DD HH:MM, blank for now (or SAME): {p['starts_at'] if p and p['starts_at'] else '-'}")
+    await m.answer(f"Start date/time UTC YYYY-MM-DD HH:MM, blank for now (or SAME): {p['starts_at'] if p and p['starts_at'] else '-'}",reply_markup=back_kb())
 
 def _promo_dt(raw, current=None):
     raw=(raw or '').strip()
@@ -252,32 +253,32 @@ def _promo_dt(raw, current=None):
 async def pstart_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None; v=_promo_dt(m.text,p['starts_at'] if p else None)
-    if v=='__INVALID__': return await m.answer('Use YYYY-MM-DD HH:MM or leave blank.')
-    await state.update_data(starts_at=v); await state.set_state(MFlow.promo_end); await m.answer('End date/time UTC YYYY-MM-DD HH:MM, blank for no expiry (or SAME):')
+    if v=='__INVALID__': return await m.answer('Use YYYY-MM-DD HH:MM or leave blank.',reply_markup=back_kb())
+    await state.update_data(starts_at=v); await state.set_state(MFlow.promo_end); await m.answer('End date/time UTC YYYY-MM-DD HH:MM, blank for no expiry (or SAME):',reply_markup=back_kb())
 
 @router.message(MFlow.promo_end)
 async def pend_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None; v=_promo_dt(m.text,p['ends_at'] if p else None)
-    if v=='__INVALID__': return await m.answer('Use YYYY-MM-DD HH:MM or leave blank.')
-    await state.update_data(ends_at=v); await state.set_state(MFlow.promo_min); await m.answer("Minimum order value in so'm (0 for none, or SAME):")
+    if v=='__INVALID__': return await m.answer('Use YYYY-MM-DD HH:MM or leave blank.',reply_markup=back_kb())
+    await state.update_data(ends_at=v); await state.set_state(MFlow.promo_min); await m.answer("Minimum order value in so'm (0 for none, or SAME):",reply_markup=back_kb())
 
 @router.message(MFlow.promo_min)
 async def pmin_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None; raw=(m.text or '').strip(); v=p['min_subtotal'] if p and raw.upper()=='SAME' else int(raw or 0) if raw.isdigit() else -1
-    if v<0: return await m.answer('Send a whole number.')
-    await state.update_data(min_subtotal=v); await state.set_state(MFlow.promo_max); await m.answer('Maximum uses (0 = unlimited, or SAME):')
+    if v<0: return await m.answer('Send a whole number.',reply_markup=back_kb())
+    await state.update_data(min_subtotal=v); await state.set_state(MFlow.promo_max); await m.answer('Maximum uses (0 = unlimited, or SAME):',reply_markup=back_kb())
 
 @router.message(MFlow.promo_max)
 async def pmax_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None; raw=(m.text or '').strip(); v=p['max_uses'] if p and raw.upper()=='SAME' else int(raw or 0) if raw.isdigit() else -1
-    if v<0: return await m.answer('Send a whole number.')
+    if v<0: return await m.answer('Send a whole number.',reply_markup=back_kb())
     await state.update_data(max_uses=v); await state.set_state(MFlow.promo_daily)
     p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None
     current=f" Current: {p['daily_start']}-{p['daily_end']}." if p and p.get('daily_start') else ''
-    await m.answer("Recurring daily window? e.g. 15:00-17:00 for every-day happy hour, or blank for a normal one-time promo (or SAME)."+current)
+    await m.answer("Recurring daily window? e.g. 15:00-17:00 for every-day happy hour, or blank for a normal one-time promo (or SAME)."+current,reply_markup=back_kb())
 
 def _promo_daily(raw, current_start=None, current_end=None):
     raw=(raw or '').strip()
@@ -295,14 +296,14 @@ async def pdaily_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     d=await state.get_data(); p=db.get_promotion(d['edit_id']) if 'edit_id' in d else None
     daily_start, daily_end = _promo_daily(m.text, p['daily_start'] if p else None, p['daily_end'] if p else None)
-    if daily_start=='__INVALID__': return await m.answer("Use HH:MM-HH:MM (e.g. 15:00-17:00) or leave blank.")
+    if daily_start=='__INVALID__': return await m.answer("Use HH:MM-HH:MM (e.g. 15:00-17:00) or leave blank.",reply_markup=back_kb())
     try:
         if 'edit_id' in d:
             db.update_promotion(d['edit_id'],d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),d.get('max_uses',0),daily_start,daily_end); msg='✅ Promotion updated.'
         else:
             db.add_promotion(d['name'],d['code'],d['kind'],d['value'],d.get('starts_at'),d.get('ends_at'),d.get('min_subtotal',0),d.get('max_uses',0),daily_start,daily_end); msg='✅ Promotion created. It is inactive until you activate it.'
     except sqlite3.IntegrityError:
-        return await m.answer('That promo code already exists. Choose a different code.')
+        return await m.answer('That promo code already exists. Choose a different code.',reply_markup=back_kb())
     await state.clear(); await m.answer(msg); await render_promos(m)
 
 @router.callback_query(F.data.startswith('m:promo:'))
@@ -320,7 +321,7 @@ async def pedit(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
     pid=int(c.data.split(':')[-1]); p=db.get_promotion(pid)
     if not p: return await c.answer('Not found',show_alert=True)
-    await state.set_data({'edit_id':pid}); await state.set_state(MFlow.promo_name); await c.message.answer(f"Current name: {p['name']}\nSend new name (or SAME):"); await c.answer()
+    await state.set_data({'edit_id':pid}); await state.set_state(MFlow.promo_name); await c.message.answer(f"Current name: {p['name']}\nSend new name (or SAME):",reply_markup=back_kb()); await c.answer()
 
 @router.callback_query(F.data.startswith('m:promotoggle:'))
 async def ptog(c:CallbackQuery):
@@ -429,24 +430,24 @@ async def birthday(c:CallbackQuery):
 @router.callback_query(F.data=='m:bdpct')
 async def bdpct(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    await state.set_state(MFlow.birthday_percent); await c.message.answer('Send birthday discount percent (1–100):'); await c.answer()
+    await state.set_state(MFlow.birthday_percent); await c.message.answer('Send birthday discount percent (1–100):',reply_markup=back_kb()); await c.answer()
 @router.message(MFlow.birthday_percent)
 async def bdpct_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     try: v=int((m.text or '').strip())
-    except ValueError: return await m.answer('Send a whole number.')
-    if not 1<=v<=100: return await m.answer('Use 1–100.')
+    except ValueError: return await m.answer('Send a whole number.',reply_markup=back_kb())
+    if not 1<=v<=100: return await m.answer('Use 1–100.',reply_markup=back_kb())
     db.set_setting('birthday_discount_percent',str(v)); await state.clear(); await m.answer('✅ Birthday discount updated.'); await m.answer('Use /manager → Birthday to review it.',reply_markup=manager_kb())
 @router.callback_query(F.data=='m:bddays')
 async def bddays(c:CallbackQuery,state:FSMContext):
     if not owner(c.from_user.id): return
-    await state.set_state(MFlow.birthday_days); await c.message.answer('Send validity in days (1–30):'); await c.answer()
+    await state.set_state(MFlow.birthday_days); await c.message.answer('Send validity in days (1–30):',reply_markup=back_kb()); await c.answer()
 @router.message(MFlow.birthday_days)
 async def bddays_set(m:Message,state:FSMContext):
     if not owner(m.from_user.id): return
     try: v=int((m.text or '').strip())
-    except ValueError: return await m.answer('Send a whole number.')
-    if not 1<=v<=30: return await m.answer('Use 1–30.')
+    except ValueError: return await m.answer('Send a whole number.',reply_markup=back_kb())
+    if not 1<=v<=30: return await m.answer('Use 1–30.',reply_markup=back_kb())
     db.set_setting('birthday_reward_valid_days',str(v)); await state.clear(); await m.answer('✅ Birthday validity updated.'); await m.answer('Use /manager → Birthday to review it.',reply_markup=manager_kb())
 
 # ---------- broadcast ----------
@@ -468,7 +469,7 @@ async def broadcast_audience(c:CallbackQuery,state:FSMContext):
     await state.update_data(audience=audience)
     await state.set_state(MFlow.broadcast_text)
     label='all customers' if audience=='all' else 'customers inactive 30+ days (win-back)'
-    await c.message.answer(f"📢 Send what you want to broadcast to {label}.\n\nEither send a photo with a caption (for a picture ad), or just plain text.\n\nThis goes out immediately to that group once you confirm — there's a review step next.")
+    await c.message.answer(f"📢 Send what you want to broadcast to {label}.\n\nEither send a photo with a caption (for a picture ad), or just plain text.\n\nThis goes out immediately to that group once you confirm — there's a review step next.",reply_markup=back_kb())
     await c.answer()
 
 def _broadcast_recipients(audience:str) -> list[int]:

@@ -498,6 +498,20 @@ def save_birthday(user_id: int, month_day: str):
         )
 
 
+def get_birthday(user_id: int) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT birthday FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def clear_birthday(user_id: int):
+    """Owner-only override for correcting a mistyped birthday — see /resetbirthday.
+    Customers can't call this themselves; the birthday is otherwise locked once set
+    so it can't be changed on demand to instantly trigger the reward."""
+    with get_db() as conn:
+        conn.execute("UPDATE users SET birthday = NULL WHERE user_id = ?", (user_id,))
+
+
 def get_birthdays_today(month_day: str) -> list[int]:
     with get_db() as conn:
         rows = conn.execute("SELECT user_id FROM users WHERE birthday = ?", (month_day,)).fetchall()

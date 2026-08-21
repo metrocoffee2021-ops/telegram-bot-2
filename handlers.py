@@ -213,6 +213,7 @@ MENU_BUTTON_TEXTS = {t(l, "menu_button") for l in _ALL_LANGS}
 CART_BUTTON_TEXTS = {t(l, "cart_button") for l in _ALL_LANGS}
 STAMPS_BUTTON_TEXTS = {t(l, "stamps_button") for l in _ALL_LANGS}
 MY_ORDERS_BUTTON_TEXTS = {t(l, "my_orders_button") for l in _ALL_LANGS}
+BACK_BUTTON_TEXTS = {t(l, "back_button") for l in _ALL_LANGS}
 
 
 @router.message(F.text.in_(MENU_BUTTON_TEXTS))
@@ -845,6 +846,7 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
             kb = InlineKeyboardBuilder()
             kb.button(text=t(lang, "birthday_choose_button"), callback_data="birthday_choose")
             kb.button(text=t(lang, "birthday_skip_button"), callback_data="birthday_skip")
+            kb.button(text=t(lang, "back_button"), callback_data="cart")
             kb.adjust(1)
             sent = await respond(target, text, reply_markup=kb.as_markup(), parse_mode="HTML")
             if not isinstance(target, CallbackQuery):
@@ -865,7 +867,10 @@ async def show_cart(target, offer_payment: bool = False, state: FSMContext = Non
 
         await state.set_state(OrderFlow.awaiting_contact)
         contact_kb = ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)]],
+            keyboard=[
+                [KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)],
+                [KeyboardButton(text=t(lang, "back_button"))],
+            ],
             resize_keyboard=True,
             one_time_keyboard=True,
         )
@@ -899,6 +904,7 @@ async def prompt_branch_choice(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
     for i, b in enumerate(branches.all_branches()):
         kb.button(text="🏪 " + b["name"], callback_data=f"branchset:{i}")
+    kb.button(text=t(lang, "back_button"), callback_data="cart")
     kb.adjust(1)
     await respond(callback, {"uz":"Filialni tanlang:","ru":"Выберите филиал:","en":"Choose your branch:"}[lang], reply_markup=kb.as_markup())
 
@@ -951,7 +957,8 @@ async def prompt_payment(user_id: int, lang: str, state: FSMContext, send):
     kb.button(text={"uz":"🎟 Promo","ru":"🎟 Промокод","en":"🎟 Promo code"}[lang], callback_data="promo_enter")
     kb.button(text={"uz":"🏪 Filial","ru":"🏪 Филиал","en":"🏪 Branch"}[lang], callback_data="choosebranch")
     kb.button(text={"uz":"🚗 Yetkazib berish","ru":"🚗 Доставка","en":"🚗 Delivery"}[lang], callback_data="fulfillment:delivery")
-    kb.adjust(2, 1, 1, 1)
+    kb.button(text=t(lang, "back_button"), callback_data="cart")
+    kb.adjust(2, 1, 1, 1, 1)
     await send(summary, reply_markup=kb.as_markup(), parse_mode="HTML")
     await state.set_state(OrderFlow.choosing_payment_method)
 
@@ -993,7 +1000,10 @@ async def ask_for_location(user_id: int, lang: str, fulfillment: str, state: FSM
     await state.set_state(OrderFlow.awaiting_location)
     prompt_key = "share_location_delivery_prompt" if fulfillment == "delivery" else "share_location_prompt"
     location_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
+        keyboard=[
+            [KeyboardButton(text=t(lang, "share_location_button"), request_location=True)],
+            [KeyboardButton(text=t(lang, "back_button"))],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1024,11 +1034,22 @@ async def change_branch(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.message(OrderFlow.awaiting_contact, F.text.in_(BACK_BUTTON_TEXTS))
+async def contact_back(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    await state.clear()
+    await message.answer(t(lang, "shortcuts_ready"), reply_markup=persistent_keyboard(lang))
+    await show_cart_editable(message)
+
+
 @router.message(OrderFlow.awaiting_contact)
 async def contact_not_shared(message: Message):
     lang = lang_of(message.from_user.id)
     contact_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)]],
+        keyboard=[
+            [KeyboardButton(text=t(lang, "share_contact_button"), request_contact=True)],
+            [KeyboardButton(text=t(lang, "back_button"))],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1110,11 +1131,22 @@ async def pickup_time_chosen(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.message(OrderFlow.awaiting_location, F.text.in_(BACK_BUTTON_TEXTS))
+async def location_back(message: Message, state: FSMContext):
+    lang = lang_of(message.from_user.id)
+    await state.clear()
+    await message.answer(t(lang, "shortcuts_ready"), reply_markup=persistent_keyboard(lang))
+    await show_cart_editable(message)
+
+
 @router.message(OrderFlow.awaiting_location)
 async def location_not_shared(message: Message):
     lang = lang_of(message.from_user.id)
     location_kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=t(lang, "share_location_button"), request_location=True)]],
+        keyboard=[
+            [KeyboardButton(text=t(lang, "share_location_button"), request_location=True)],
+            [KeyboardButton(text=t(lang, "back_button"))],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1200,8 +1232,16 @@ async def promo_command(message: Message, state: FSMContext):
 async def promo_enter(callback: CallbackQuery, state: FSMContext):
     lang=lang_of(callback.from_user.id)
     await state.set_state(OrderFlow.awaiting_promo_code)
-    sent=await callback.message.answer(promo_label(lang,"enter"))
+    kb=InlineKeyboardBuilder(); kb.button(text=t(lang,"back_button"), callback_data="promo_cancel")
+    sent=await callback.message.answer(promo_label(lang,"enter"), reply_markup=kb.as_markup())
     track_checkout_message(callback.from_user.id, sent.message_id)
+    await callback.answer()
+
+@router.callback_query(F.data == "promo_cancel")
+async def promo_cancel(callback: CallbackQuery, state: FSMContext):
+    lang=lang_of(callback.from_user.id)
+    await state.set_state(OrderFlow.choosing_payment_method)
+    await prompt_payment(callback.from_user.id, lang, state, send=callback.message.answer)
     await callback.answer()
 
 @router.message(OrderFlow.awaiting_promo_code)
@@ -1909,6 +1949,13 @@ async def rate_order(callback: CallbackQuery):
 @router.message(Command("birthday"))
 async def set_birthday(message: Message):
     lang = lang_of(message.from_user.id)
+
+    existing = db.get_birthday(message.from_user.id)
+    if existing:
+        month, day = existing.split("-")
+        await message.answer(t(lang, "birthday_already_set", date=f"{day}-{month}"))
+        return
+
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer(t(lang, "birthday_usage"))
@@ -1937,6 +1984,21 @@ async def set_birthday(message: Message):
     if month_day == local_today:
         db.issue_birthday_reward(message.from_user.id, (datetime.utcnow() + timedelta(hours=5)).year)
     await message.answer(t(lang, "birthday_saved"))
+
+
+@router.message(Command("resetbirthday"))
+async def reset_birthday_command(message: Message):
+    """Owner-only — corrects a customer's mistyped birthday by unlocking it so
+    they can set it again with /birthday. Usage: /resetbirthday <telegram_id>"""
+    if not (OWNER_ID and message.from_user.id == OWNER_ID):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("Usage: /resetbirthday <telegram_id>")
+        return
+    target_id = int(parts[1].strip())
+    db.clear_birthday(target_id)
+    await message.answer(f"✅ Birthday cleared for {target_id} — they can set it again with /birthday.")
 
 
 @router.message(Command("myorders"))

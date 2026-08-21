@@ -36,6 +36,27 @@ def is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
 
+def cancel_kb(lang):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(lang, "admin_cancel_button"), callback_data="adm_cancel")
+    return kb.as_markup()
+
+
+@router.callback_query(F.data == "adm_cancel")
+async def admin_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    if data.get("item_id"):
+        await show_item(callback.from_user.id, data["item_id"], callback.message.answer)
+    elif data.get("category_id") or data.get("cat_id"):
+        await show_category(callback.from_user.id, data.get("category_id") or data.get("cat_id"), callback.message.answer)
+    else:
+        await show_categories(callback.from_user.id, callback.message.answer)
+    await callback.answer()
+
+
 def lang_of(user_id: int) -> str:
     return db.get_user_language(user_id)
 
@@ -94,7 +115,7 @@ async def add_category_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"mode": "new_category"})
     await state.set_state(AdminFlow.name_uz)
-    await callback.message.answer(t(lang, "admin_send_name_uz"))
+    await callback.message.answer(t(lang, "admin_send_name_uz"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -106,7 +127,7 @@ async def rename_category_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"mode": "rename_category", "category_id": cat_id})
     await state.set_state(AdminFlow.name_uz)
-    await callback.message.answer(t(lang, "admin_send_name_uz"))
+    await callback.message.answer(t(lang, "admin_send_name_uz"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -119,7 +140,7 @@ async def got_name_uz(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
     await state.update_data(name_uz=message.text.strip())
     await state.set_state(AdminFlow.name_ru)
-    await message.answer(t(lang, "admin_send_name_ru"))
+    await message.answer(t(lang, "admin_send_name_ru"), reply_markup=cancel_kb(lang))
 
 
 @router.message(AdminFlow.name_ru)
@@ -131,7 +152,7 @@ async def got_name_ru(message: Message, state: FSMContext):
     lang = lang_of(message.from_user.id)
     await state.update_data(name_ru=message.text.strip())
     await state.set_state(AdminFlow.name_en)
-    await message.answer(t(lang, "admin_send_name_en"))
+    await message.answer(t(lang, "admin_send_name_en"), reply_markup=cancel_kb(lang))
 
 
 @router.message(AdminFlow.name_en)
@@ -216,7 +237,7 @@ async def edit_emoji_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"cat_id": cat_id})
     await state.set_state(EmojiFlow.awaiting_emoji)
-    await callback.message.answer(t(lang, "admin_send_emoji"))
+    await callback.message.answer(t(lang, "admin_send_emoji"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -278,7 +299,7 @@ async def add_item_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"mode": "new_item", "category_id": cat_id})
     await state.set_state(AdminFlow.name_uz)
-    await callback.message.answer(t(lang, "admin_send_name_uz"))
+    await callback.message.answer(t(lang, "admin_send_name_uz"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -290,7 +311,7 @@ async def rename_item_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"mode": "rename_item", "item_id": item_id})
     await state.set_state(AdminFlow.name_uz)
-    await callback.message.answer(t(lang, "admin_send_name_uz"))
+    await callback.message.answer(t(lang, "admin_send_name_uz"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -302,6 +323,7 @@ async def ask_temp_option(user_id: int, item_id: int, send):
     kb.button(text=t(lang, "admin_temp_hot_only"), callback_data=f"admtemp:{item_id}:hot")
     kb.button(text=t(lang, "admin_temp_sovuq_only"), callback_data=f"admtemp:{item_id}:iced")
     kb.button(text=t(lang, "admin_temp_both"), callback_data=f"admtemp:{item_id}:both")
+    kb.button(text=t(lang, "admin_cancel_button"), callback_data="adm_cancel")
     kb.adjust(1)
     await send(t(lang, "admin_choose_temp_option"), reply_markup=kb.as_markup())
 
@@ -332,6 +354,7 @@ async def temp_chosen(callback: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text=t(lang, "admin_size_single"), callback_data="admsize:single")
     kb.button(text=t(lang, "admin_size_two"), callback_data="admsize:two")
+    kb.button(text=t(lang, "admin_cancel_button"), callback_data="adm_cancel")
     kb.adjust(1)
     await callback.message.answer(t(lang, "admin_choose_size_option"), reply_markup=kb.as_markup())
     await callback.answer()
@@ -364,7 +387,7 @@ async def ask_next_price(user_id: int, state: FSMContext, send):
     data = await state.get_data()
     queue = data["price_queue"]
     temp, size = queue[0]
-    await send(t(lang, "admin_send_price_for", label=variant_label(temp, size)))
+    await send(t(lang, "admin_send_price_for", label=variant_label(temp, size)), reply_markup=cancel_kb(lang))
 
 
 def parse_price(text: str | None) -> int | None:
@@ -467,7 +490,7 @@ async def edit_photo_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"item_id": item_id})
     await state.set_state(PhotoFlow.awaiting_photo)
-    await callback.message.answer(t(lang, "admin_send_photo"))
+    await callback.message.answer(t(lang, "admin_send_photo"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -510,7 +533,7 @@ async def edit_description_start(callback: CallbackQuery, state: FSMContext):
     lang = lang_of(callback.from_user.id)
     await state.set_data({"item_id": item_id})
     await state.set_state(DescFlow.awaiting_description)
-    await callback.message.answer(t(lang, "admin_send_description"))
+    await callback.message.answer(t(lang, "admin_send_description"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
@@ -545,9 +568,10 @@ async def edit_price_start(callback: CallbackQuery, state: FSMContext):
         return
     variant_id = int(callback.data.split(":")[1])
     lang = lang_of(callback.from_user.id)
-    await state.set_data({"variant_id": variant_id})
+    variant = menu_store.get_variant(variant_id)
+    await state.set_data({"variant_id": variant_id, "item_id": variant["item_id"] if variant else None})
     await state.set_state(AdminFlow.editing_price)
-    await callback.message.answer(t(lang, "admin_send_new_price"))
+    await callback.message.answer(t(lang, "admin_send_new_price"), reply_markup=cancel_kb(lang))
     await callback.answer()
 
 
